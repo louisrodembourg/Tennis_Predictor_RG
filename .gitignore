@@ -1,0 +1,59 @@
+# Environnements virtuels
+.venv/
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Données brutes (volumineuses, à télécharger via download_data.sh)
+data/raw/
+
+# Données traitées (regénérables)
+data/processed/
+
+# Résultats RG 2026 (locaux, sensibles)
+data/rg2026/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Logs
+*.log
+logs/
+
+# Variables d'environnement
+.env
+.env.local
