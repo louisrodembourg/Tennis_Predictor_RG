@@ -89,14 +89,18 @@ def train_model(
     feature_df: pd.DataFrame,
     feature_cols: list[str] = FEATURE_COLS,
     calibrate: bool = True,
+    xgb_params: dict | None = None,
+    calibration_method: str = "isotonic",
+    calibration_cv: int = 3,
 ) -> XGBClassifier | CalibratedClassifierCV:
     """Entraîne le modèle de base (historique) sur feature_df symétrisé."""
     sym_df = build_symmetric_dataset(feature_df)
     X = sym_df[feature_cols].fillna(0)
     y = sym_df["target"]
-    model = XGBClassifier(**XGB_PARAMS)
+    params = xgb_params if xgb_params is not None else XGB_PARAMS
+    model = XGBClassifier(**params)
     if calibrate:
-        model = CalibratedClassifierCV(model, cv=3, method="isotonic")
+        model = CalibratedClassifierCV(model, cv=calibration_cv, method=calibration_method)
     model.fit(X, y)
     return model
 
@@ -203,6 +207,9 @@ def expanding_window_backtest(
     feature_cols: list[str] = FEATURE_COLS,
     blend_alpha: float = BLEND_ALPHA,
     rg_raw_df: Optional[pd.DataFrame] = None,
+    xgb_params: dict | None = None,
+    calibration_method: str = "isotonic",
+    calibration_cv: int = 3,
 ) -> list[BacktestResult]:
     """
     Pour chaque édition RG (2017-2025) :
@@ -232,7 +239,12 @@ def expanding_window_backtest(
             continue
 
         pbar.set_description(f"Backtest RG {year} (train={len(train_df):,})")
-        base_model = train_model(train_df, feature_cols, calibrate=True)
+        base_model = train_model(
+            train_df, feature_cols, calibrate=True,
+            xgb_params=xgb_params,
+            calibration_method=calibration_method,
+            calibration_cv=calibration_cv,
+        )
 
         # --- Simulation online round par round (tableau principal uniquement) ---
         rounds = sorted(r for r in rg_year_df["round_number"].unique()

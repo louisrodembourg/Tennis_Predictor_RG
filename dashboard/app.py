@@ -354,6 +354,38 @@ def page_results(predictor):
         st.write("Aucun résultat encore saisi.")
 
 
+def _compare_optuna_vs_default(results_default: list, results_opt: list):
+    """Tableau comparatif Brier Base — params défaut vs params Optuna."""
+    st.subheader("Comparaison : défaut vs paramètres optimisés")
+    rows = []
+    opt_by_year = {r.year: r for r in results_opt}
+    for r in results_default:
+        r_opt = opt_by_year.get(r.year)
+        rows.append({
+            "Année": r.year,
+            "Brier défaut": f"{r.brier:.4f}",
+            "Brier Optuna": f"{r_opt.brier:.4f}" if r_opt else "—",
+            "Δ Brier": f"{r_opt.brier - r.brier:+.4f}" if r_opt else "—",
+            "Acc défaut": f"{r.accuracy:.1%}",
+            "Acc Optuna": f"{r_opt.accuracy:.1%}" if r_opt else "—",
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # Moyennes
+    def _mean(rs, attr):
+        vals = [getattr(r, attr) for r in rs]
+        return np.mean(vals)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Brier moyen — défaut", f"{_mean(results_default, 'brier'):.4f}")
+    with col2:
+        st.metric("Brier moyen — Optuna", f"{_mean(results_opt, 'brier'):.4f}")
+    with col3:
+        delta = _mean(results_opt, "brier") - _mean(results_default, "brier")
+        st.metric("Δ Brier", f"{delta:+.4f}", delta_color="inverse")
+
+
 def page_backtest(predictor):
     st.title("Backtesting & Performance Historique")
 
@@ -383,11 +415,123 @@ def page_backtest(predictor):
         # Persister les résultats dans session_state pour survivre aux re-renders
         st.session_state["bt_results"] = results
         st.session_state["bt_baseline"] = baseline_df
+        st.session_state["bt_all_feat"] = bt["all_features"]
+        st.session_state["bt_rg_feat"]  = bt["rg_features"]
 
     # Afficher les résultats s'ils existent en session (persistent après le clic)
     if "bt_results" in st.session_state and st.session_state["bt_results"]:
         _display_backtest(st.session_state["bt_results"], st.session_state["bt_baseline"])
 
+    # ----------------------------------------------------------------
+    # Section Optuna — optimisation des hyperparamètres
+    # ----------------------------------------------------------------
+    st.markdown("---")
+    st.subheader("Optimisation des hyperparamètres (Optuna)")
+
+    has_feats = "bt_all_feat" in st.session_state and "bt_rg_feat" in st.session_state
+    if not has_feats:
+        st.info("Lancez d'abord le backtesting ci-dessus pour charger les features nécessaires à Optuna.")
+    else:
+        from hyperopt import (
+            CV_YEARS, BEST_PARAMS_PATH, load_best_params,
+            run_optuna, save_best_params, get_xgb_params,
+        )
+
+        existing = load_best_params()
+        if existing:
+            st.success(
+                f"Meilleurs params trouvés : Brier = **{existing['_best_brier']:.4f}** "
+                f"({existing['_n_trials']} trials) — `{BEST_PARAMS_PATH.name}`"
+            )
+
+        col_opt1, col_opt2 = st.columns([1, 3])
+        with col_opt1:
+            n_trials = st.number_input("Nombre de trials", min_value=10, max_value=500, value=50, step=10)
+        with col_opt2:
+            st.caption(
+                f"CV sur {len(CV_YEARS)} années ({CV_YEARS[0]}–{CV_YEARS[-1]}) — "
+                f"2023–2025 gardés comme holdout. "
+                f"Durée estimée : {n_trials * 6 * 3 // 60 + 1}–{n_trials * 6 * 8 // 60 + 1} min."
+            )
+
+        if st.button("Lancer Optuna", type="primary"):
+            progress_placeholder = st.empty()
+            progress_bar = st.progress(0)
+            log_lines: list[str] = []
+
+            def _on_trial(n_done: int, best_val: float, _best_p: dict) -> None:
+                pct = int(n_done / n_trials * 100)
+                progress_bar.progress(pct)
+                log_lines.append(f"Trial {n_done:3d} | Best Brier : {best_val:.4f}")
+                progress_placeholder.code("\n".join(log_lines[-8:]), language="text")
+
+            with st.spinner("Optuna en cours..."):
+                study = run_optuna(
+                    st.session_state["bt_all_feat"],
+                    st.session_state["bt_rg_feat"],
+                    n_trials=int(n_trials),
+                    on_trial_end=_on_trial,
+                )
+            best = save_best_params(study)
+            st.session_state["optuna_best"] = best
+            progress_bar.progress(100)
+            st.success(f"Optimisation terminée — Best Brier : **{best['_best_brier']:.4f}**")
+            st.rerun()
+
+        # Affichage des meilleurs paramètres
+        display_best = st.session_state.get("optuna_best") or existing
+        if display_best:
+            st.markdown("**Meilleurs paramètres trouvés :**")
+            xgb_p = get_xgb_params(display_best)
+            cal_method = display_best.get("calibration_method", "isotonic")
+            cal_cv = int(display_best.get("calibration_cv", 3))
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                params_df = pd.DataFrame(
+                    [{"Paramètre": k, "Valeur": v} for k, v in xgb_p.items()]
+                )
+                st.dataframe(params_df, use_container_width=True, hide_index=True)
+            with col_b:
+                st.metric("calibration_method", cal_method)
+                st.metric("calibration_cv", cal_cv)
+                st.metric("CV Brier (2017-2022)", f"{display_best['_best_brier']:.4f}")
+
+            with st.expander("Snippet à copier dans model.py"):
+                snippet_lines = ["XGB_PARAMS = {"]
+                for k, v in xgb_p.items():
+                    val_repr = f'"{v}"' if isinstance(v, str) else repr(v)
+                    snippet_lines.append(f'    "{k}": {val_repr},')
+                snippet_lines.append("}")
+                st.code("\n".join(snippet_lines), language="python")
+
+            # Valider avec un backtest complet sur les mêmes données
+            has_default_results = (
+                "bt_results" in st.session_state and st.session_state["bt_results"]
+            )
+            if has_default_results and st.button("Valider avec le backtest (params optimisés vs défaut)"):
+                from model import expanding_window_backtest
+                with st.spinner("Backtest avec params optimisés..."):
+                    results_opt = expanding_window_backtest(
+                        st.session_state["bt_all_feat"],
+                        st.session_state["bt_rg_feat"],
+                        xgb_params=xgb_p,
+                        calibration_method=cal_method,
+                        calibration_cv=cal_cv,
+                    )
+                st.session_state["bt_results_opt"] = results_opt
+
+            if (
+                has_default_results
+                and "bt_results_opt" in st.session_state
+                and st.session_state["bt_results_opt"]
+            ):
+                _compare_optuna_vs_default(
+                    st.session_state["bt_results"],
+                    st.session_state["bt_results_opt"],
+                )
+
+    # ----------------------------------------------------------------
     # Affichage de l'historique sauvegardé
     if results_path.exists():
         st.subheader("Historique des runs")
