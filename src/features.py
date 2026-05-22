@@ -251,20 +251,21 @@ class HistoryIndex:
             cw6  = _ws(cs_cw, 183); cm6  = _ws(cs_cm, 183)
             w30  = _ws(cs_w, 30);   m30  = np.arange(n, dtype=float) - np.searchsorted(dates, dates - 30 * DAY, side="left")
 
-            out_wr_clay_12m[s:e] = np.where(cm12 > 0, cw12 / cm12, 0.5)
-            out_wr_clay_6m[s:e]  = np.where(cm6  > 0, cw6  / cm6,  0.5)
-            out_wr_30d[s:e]      = np.where(m30  > 0, w30  / m30,   0.5)
+            np.divide(cw12, cm12, out=out_wr_clay_12m[s:e], where=(cm12 > 0))
+            np.divide(cw6,  cm6,  out=out_wr_clay_6m[s:e],  where=(cm6  > 0))
+            np.divide(w30,  m30,  out=out_wr_30d[s:e],      where=(m30  > 0))
             out_matches_before[s:e] = idx.astype(float)
             out_wins_before[s:e]    = cs_w[idx]
 
             # win_rate_last10 via rolling numpy cumsum
             cs_w_full = np.concatenate([[0.0], np.cumsum(won_arr)])
-            end10 = idx  # cumsum index at position i = # wins in [0, i)
+            end10 = idx
             st10  = np.maximum(0, idx - 10)
             cnt10 = idx - st10
-            out_wr_last10[s:e] = np.where(cnt10 > 0,
-                                           (cs_w_full[end10] - cs_w_full[st10]) / cnt10,
-                                           0.5)
+            np.divide(
+                cs_w_full[end10] - cs_w_full[st10], cnt10,
+                out=out_wr_last10[s:e], where=(cnt10 > 0),
+            )
 
             # Service stats via rolling numpy cumsum (shifted: exclude current)
             if srv_ok:
@@ -272,12 +273,12 @@ class HistoryIndex:
                 fw = fwon_col[s:e]; bf = bpf_col[s:e]; bs = bps_col[s:e]
                 def _srv(arr: np.ndarray, w: int = 20) -> np.ndarray:
                     cs = np.empty(n + 1); cs[0] = 0.0; np.cumsum(arr, out=cs[1:])
-                    st = np.maximum(0, idx - w)    # shifted: use cs[idx] not cs[idx+1]
+                    st = np.maximum(0, idx - w)
                     return cs[idx] - cs[st]
                 sv20 = _srv(sv); fi20 = _srv(fi); fw20 = _srv(fw); bf20 = _srv(bf); bs20 = _srv(bs)
-                out_fsp[s:e]  = np.where(sv20 > 0, fi20 / sv20, 0.6)
-                out_fswp[s:e] = np.where(fi20 > 0, fw20 / fi20, 0.7)
-                out_bpsp[s:e] = np.where(bf20 > 0, bs20 / bf20, 0.6)
+                np.divide(fi20, sv20, out=out_fsp[s:e],  where=(sv20 > 0))
+                np.divide(fw20, fi20, out=out_fswp[s:e], where=(fi20 > 0))
+                np.divide(bs20, bf20, out=out_bpsp[s:e], where=(bf20 > 0))
 
         result = pd.DataFrame({
             "player":              player_col,

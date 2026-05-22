@@ -92,12 +92,16 @@ def load_matches(data_dir: str, year_start: int = 2000, year_end: int = 2025) ->
     # Normaliser surface
     df["surface"] = df["surface"].map(SURFACE_MAP).fillna("Unknown")
 
-    # Encoder le tour en entier (1=R128, 7=F)
+    # Encoder le tour en entier (1=R128, 7=F ; qualifications = -2/-1/0)
     round_order = {
+        "Q1": -2, "Q2": -1, "Q3": 0,           # qualifications
         "R128": 1, "R64": 2, "R32": 3, "R16": 4,
         "QF": 5, "SF": 6, "F": 7, "RR": 3,
     }
     df["round_number"] = df["round"].map(round_order).fillna(3).astype(int)
+
+    # Normaliser tourney_level en string (certains CSV anciens ont des entiers)
+    df["tourney_level"] = df["tourney_level"].astype(str).str.strip().replace("nan", "")
 
     # Encoder le niveau de tournoi (pour K factor)
     level_k = {"G": 40, "M": 32, "A": 24, "D": 20, "C": 20, "F": 30}

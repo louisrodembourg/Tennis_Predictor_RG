@@ -380,8 +380,13 @@ def page_backtest(predictor):
 
         st.success(f"Résultats sauvegardés dans `{saved_path.relative_to(Path(__file__).parent.parent)}`")
 
-        if results:
-            _display_backtest(results, baseline_df)
+        # Persister les résultats dans session_state pour survivre aux re-renders
+        st.session_state["bt_results"] = results
+        st.session_state["bt_baseline"] = baseline_df
+
+    # Afficher les résultats s'ils existent en session (persistent après le clic)
+    if "bt_results" in st.session_state and st.session_state["bt_results"]:
+        _display_backtest(st.session_state["bt_results"], st.session_state["bt_baseline"])
 
     # Affichage de l'historique sauvegardé
     if results_path.exists():
@@ -400,25 +405,73 @@ def page_backtest(predictor):
 
 def _display_backtest(results: list, baseline_df: pd.DataFrame):
     """Affiche les graphes et tableaux de résultats de backtest."""
-    st.subheader("Accuracy par édition")
+    st.subheader("Accuracy par édition (Base vs Blend)")
     rows = []
     for r in results:
         rows.append({
             "Année": r.year,
-            "Accuracy": f"{r.accuracy:.1%}",
-            "Brier Score": f"{r.brier:.4f}",
-            "Log-Loss": f"{r.log_loss_val:.4f}",
+            "Acc Base": f"{r.accuracy:.1%}",
+            "Brier Base": f"{r.brier:.4f}",
+            "Acc Blend": f"{r.accuracy_blend:.1%}",
+            "Brier Blend": f"{r.brier_blend:.4f}",
+            "Log-Loss Blend": f"{r.log_loss_blend:.4f}",
             "N matchs": r.n_matches,
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+    # Courbe base vs blend
+    line_data = []
+    for r in results:
+        line_data.append({"Année": r.year, "Accuracy": r.accuracy, "Modèle": "Base"})
+        line_data.append({"Année": r.year, "Accuracy": r.accuracy_blend, "Modèle": "Blend"})
     fig = px.line(
-        pd.DataFrame([{"Année": r.year, "Accuracy": r.accuracy} for r in results]),
-        x="Année", y="Accuracy", markers=True,
-        title="Accuracy XGBoost par édition Roland Garros",
+        pd.DataFrame(line_data), x="Année", y="Accuracy", color="Modèle", markers=True,
+        title="Accuracy Base vs Blend par édition Roland Garros",
+        color_discrete_map={"Base": "#aaaaaa", "Blend": "#e8473f"},
     )
     fig.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
+
+    # Décomposition par tour
+    st.subheader("Accuracy par phase du tournoi (moyenne 2017-2025)")
+    all_by_round = []
+    for r in results:
+        df_r = r.by_round.copy()
+        df_r["year"] = r.year
+        all_by_round.append(df_r)
+
+    if all_by_round:
+        combined = pd.concat(all_by_round, ignore_index=True)
+        pivot = combined.groupby("round_name")[["acc_base", "acc_blend", "n"]].agg(
+            {"acc_base": "mean", "acc_blend": "mean", "n": "sum"}
+        ).reset_index()
+        round_order = ["R128", "R64", "R32", "R16", "QF", "SF", "F", "Q1", "Q2", "Q3"]
+        pivot["_order"] = pivot["round_name"].map({r: i for i, r in enumerate(round_order)})
+        pivot = pivot.sort_values("_order").drop(columns="_order")
+        pivot.columns = ["Tour", "Acc Base", "Acc Blend", "N matchs"]
+
+        st.dataframe(
+            pivot.assign(**{
+                "Acc Base": pivot["Acc Base"].map("{:.1%}".format),
+                "Acc Blend": pivot["Acc Blend"].map("{:.1%}".format),
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Graphique par tour
+        round_melt = pivot.rename(columns={"Tour": "Tour"}).melt(
+            id_vars=["Tour", "N matchs"], value_vars=["Acc Base", "Acc Blend"],
+            var_name="Modèle", value_name="Accuracy",
+        )
+        fig_round = px.bar(
+            round_melt, x="Tour", y="Accuracy", color="Modèle", barmode="group",
+            title="Accuracy par phase du tournoi — Base vs Blend",
+            color_discrete_map={"Acc Base": "#aaaaaa", "Acc Blend": "#e8473f"},
+            category_orders={"Tour": ["R128", "R64", "R32", "R16", "QF", "SF", "F"]},
+        )
+        fig_round.update_yaxes(tickformat=".0%", range=[0.5, 1.0])
+        st.plotly_chart(fig_round, use_container_width=True)
 
     if not baseline_df.empty:
         st.subheader("Comparaison avec les baselines")

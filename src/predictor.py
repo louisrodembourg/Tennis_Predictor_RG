@@ -13,10 +13,11 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from cache_manager import load_cache, save_cache
 from data_loader import filter_clay, filter_roland_garros, load_matches
 from elo import EloSystem
 from features import FEATURE_COLS, HistoryIndex, build_features, build_symmetric_dataset
-from model import XGB_PARAMS, train_model
+from model import XGB_PARAMS, train_model, train_mini_model, dynamic_alpha
 
 
 class RolandGarrosPredictor:
@@ -31,30 +32,66 @@ class RolandGarrosPredictor:
         self.rg2026_path = Path(rg2026_path)
         self.rg2026_path.parent.mkdir(parents=True, exist_ok=True)
 
-        print("Chargement des données historiques...")
-        self.df = load_matches(historical_data_path)
-        self.clay_df = filter_clay(self.df)
-        self.rg_df = filter_roland_garros(self.df)
+        cached = load_cache(historical_data_path)
+        if cached:
+            # --- Chargement depuis le cache (quelques secondes) ---
+            self.df          = cached["df"]
+            self.df_with_elo = cached["df_with_elo"]
+            self.clay_df     = filter_clay(self.df)
+            self.rg_df       = filter_roland_garros(self.df)
+            self._feature_df = cached["all_features"]
+            self.model       = cached["model"]
 
-        print("Calcul des ratings Elo...")
-        self.elo = EloSystem(alpha=alpha, lambda_adj=lambda_adj)
-        self.df_with_elo = self.elo.compute(self.df)
+            # Reconstruire EloSystem à partir de l'état persisté
+            print("Reconstruction des ratings Elo (depuis cache)...")
+            self.elo = EloSystem(alpha=alpha, lambda_adj=lambda_adj)
+            self.elo.compute(self.df)  # rapide grâce au cache data — rejoue depuis zéro
 
-        # Index construit une seule fois et réutilisé pour toutes les lookups
-        print("Construction de l'index historique...")
-        self._hist_index = HistoryIndex(self.df, self.rg_df)
+            # Reconstruire HistoryIndex depuis les tables pré-calculées
+            print("Reconstruction de l'index historique (depuis cache)...")
+            self._hist_index = HistoryIndex.__new__(HistoryIndex)
+            self._hist_index._players = {}
+            self._hist_index._rg = {}
+            self._hist_index._build_player_index(self.df)
+            self._hist_index._build_rg_index(self.rg_df)
+            self._hist_index.player_state = cached["player_state"]
+            self._hist_index.rg_state     = cached["rg_state"]
+            self._hist_index.h2h_state    = cached["h2h_state"]
+        else:
+            # --- Calcul complet + sauvegarde dans le cache ---
+            print("Chargement des données historiques...")
+            self.df = load_matches(historical_data_path)
+            self.clay_df = filter_clay(self.df)
+            self.rg_df = filter_roland_garros(self.df)
 
-        print("Construction des features...")
-        self._feature_df = self._build_all_features()
+            print("Calcul des ratings Elo...")
+            self.elo = EloSystem(alpha=alpha, lambda_adj=lambda_adj)
+            self.df_with_elo = self.elo.compute(self.df)
 
-        print("Entraînement du modèle initial...")
-        self.model = train_model(self._feature_df, FEATURE_COLS)
+            print("Construction de l'index historique...")
+            self._hist_index = HistoryIndex(self.df, self.rg_df)
 
-        # État intra-tournoi RG 2026
+            print("Construction des features...")
+            self._feature_df = self._build_all_features()
+
+            print("Entraînement du modèle initial...")
+            self.model = train_model(self._feature_df, FEATURE_COLS)
+
+            save_cache(historical_data_path, {
+                "df":           self.df,
+                "df_with_elo":  self.df_with_elo,
+                "player_state": self._hist_index.player_state,
+                "rg_state":     self._hist_index.rg_state,
+                "h2h_state":    self._hist_index.h2h_state,
+                "all_features": self._feature_df,
+                "model":        self.model,
+            })
+
+        # État intra-tournoi RG 2026 (toujours rechargé depuis le JSONL)
         self._intra_rg: dict[str, dict] = {}
+        self._rg_model = None                                # mini-modèle RG 2026
         self._rg2026_results: list[dict] = self._load_rg2026_results()
 
-        # Réintégrer les résultats RG 2026 déjà saisis
         if self._rg2026_results:
             print(f"Réintégration de {len(self._rg2026_results)} résultats RG 2026...")
             for result in self._rg2026_results:
@@ -83,8 +120,13 @@ class RolandGarrosPredictor:
             }
 
         X = features[FEATURE_COLS].fillna(0).values.reshape(1, -1)
-        proba = self.model.predict_proba(X)[0]
-        proba_a = float(proba[1])
+        base_p = float(self.model.predict_proba(X)[0][1])
+        if self._rg_model is not None:
+            rg_p = float(self._rg_model.predict_proba(X)[0][1])
+            alpha = dynamic_alpha(len(self._rg2026_results) * 2, round_number=round_number)
+            proba_a = alpha * base_p + (1.0 - alpha) * rg_p
+        else:
+            proba_a = base_p
         proba_b = 1.0 - proba_a
 
         winner = player_a if proba_a >= 0.5 else player_b
@@ -394,13 +436,12 @@ class RolandGarrosPredictor:
             self._retrain()
 
     def _retrain(self) -> None:
-        """Réentraîne le modèle sur les données + résultats RG 2026."""
+        """Entraîne le mini-modèle RG sur les résultats RG 2026 accumulés (modèle de base inchangé)."""
         rg2026_matches = self._build_rg2026_feature_df()
         if rg2026_matches is not None and not rg2026_matches.empty:
-            combined = pd.concat([self._feature_df, rg2026_matches], ignore_index=True)
+            self._rg_model = train_mini_model(rg2026_matches, FEATURE_COLS)
         else:
-            combined = self._feature_df
-        self.model = train_model(combined, FEATURE_COLS)
+            self._rg_model = None
 
     def _build_rg2026_feature_df(self) -> Optional[pd.DataFrame]:
         if not self._rg2026_results:

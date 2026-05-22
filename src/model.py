@@ -1,25 +1,30 @@
 """
 Modèle XGBoost + expanding window backtesting pour Roland Garros.
+
+Stratégie de prédiction :
+  - Modèle de base  : XGBoost calibré entraîné sur toutes les données clay historiques
+  - Mini-modèle RG  : XGBoost léger entraîné uniquement sur les matchs RG déjà joués
+  - Prédiction finale = alpha × base + (1-alpha) × mini_rg
+    (alpha décroît au fur et à mesure que les données RG s'accumulent)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import (
-    accuracy_score,
-    brier_score_loss,
-    log_loss,
-)
+from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
 from xgboost import XGBClassifier
 
 from features import FEATURE_COLS, build_features, build_symmetric_dataset
 
+
+BLEND_ALPHA = 0.70       # poids du modèle historique (0.70 = 70 % base, 30 % RG)
+MIN_RG_FOR_BLEND = 20    # nombre minimum d'exemples symétriques RG pour activer le blend
 
 XGB_PARAMS = {
     "n_estimators": 300,
@@ -32,6 +37,36 @@ XGB_PARAMS = {
     "n_jobs": -1,
 }
 
+XGB_MINI_PARAMS = {
+    "n_estimators": 80,
+    "max_depth": 3,
+    "learning_rate": 0.10,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "eval_metric": "logloss",
+    "random_state": 42,
+    "n_jobs": -1,
+}
+
+ROUND_NAMES = {
+    -2: "Q1", -1: "Q2", 0: "Q3",
+    1: "R128", 2: "R64", 3: "R32", 4: "R16", 5: "QF", 6: "SF", 7: "F",
+}
+# Tableau principal uniquement (pas les qualifications)
+MAIN_DRAW_ROUNDS = {1, 2, 3, 4, 5, 6, 7}
+
+
+@dataclass
+class RoundStat:
+    round_number: int
+    round_name: str
+    n: int
+    acc_base: float
+    brier_base: float
+    acc_blend: float
+    brier_blend: float
+    rg_matches_used: int    # matchs RG ayant servi à entraîner le mini-modèle
+
 
 @dataclass
 class BacktestResult:
@@ -40,55 +75,136 @@ class BacktestResult:
     brier: float
     log_loss_val: float
     n_matches: int
-    by_round: pd.DataFrame
+    by_round: pd.DataFrame                    # colonnes : round, round_name, n, acc_base, brier_base, acc_blend, brier_blend
+    accuracy_blend: float = 0.0
+    brier_blend: float = 0.0
+    log_loss_blend: float = 0.0
 
+
+# ---------------------------------------------------------------------------
+# Entraînement
+# ---------------------------------------------------------------------------
 
 def train_model(
     feature_df: pd.DataFrame,
     feature_cols: list[str] = FEATURE_COLS,
     calibrate: bool = True,
 ) -> XGBClassifier | CalibratedClassifierCV:
-    """Entraîne XGBoost sur feature_df (symétrisé)."""
+    """Entraîne le modèle de base (historique) sur feature_df symétrisé."""
     sym_df = build_symmetric_dataset(feature_df)
     X = sym_df[feature_cols].fillna(0)
     y = sym_df["target"]
-
     model = XGBClassifier(**XGB_PARAMS)
     if calibrate:
         model = CalibratedClassifierCV(model, cv=3, method="isotonic")
-
     model.fit(X, y)
     return model
 
 
-def predict_proba_a(model, match_features: pd.Series, feature_cols: list[str] = FEATURE_COLS) -> float:
-    """Probabilité que le joueur A gagne (features côté A)."""
-    X = match_features[feature_cols].fillna(0).values.reshape(1, -1)
-    proba = model.predict_proba(X)[0]
-    # classe 1 = A gagne
-    return float(proba[1])
+def train_mini_model(
+    rg_feature_df: pd.DataFrame,
+    feature_cols: list[str] = FEATURE_COLS,
+) -> Optional[XGBClassifier]:
+    """
+    Entraîne un mini-modèle léger sur les matchs RG déjà joués.
+    Retourne None si trop peu de données.
+    """
+    sym = build_symmetric_dataset(rg_feature_df)
+    if len(sym) < MIN_RG_FOR_BLEND:
+        return None
+    X = sym[feature_cols].fillna(0)
+    y = sym["target"]
+    model = XGBClassifier(**XGB_MINI_PARAMS)
+    model.fit(X, y)
+    return model
 
+
+# ---------------------------------------------------------------------------
+# Blend
+# ---------------------------------------------------------------------------
+
+def blend_probas(
+    base_model,
+    rg_model,
+    X: pd.DataFrame,
+    feature_cols: list[str] = FEATURE_COLS,
+    alpha: float = BLEND_ALPHA,
+) -> np.ndarray:
+    """
+    Retourne les probabilités blendées.
+    Si rg_model est None, retourne les probas du modèle de base seul.
+    alpha décroît dynamiquement avec la taille des données RG (cf. dynamic_alpha).
+    """
+    X_arr = X[feature_cols].fillna(0)
+    base_p = base_model.predict_proba(X_arr)[:, 1]
+    if rg_model is None:
+        return base_p
+    rg_p = rg_model.predict_proba(X_arr)[:, 1]
+    return alpha * base_p + (1.0 - alpha) * rg_p
+
+
+def dynamic_alpha(n_rg_matches: int, round_number: int = 1) -> float:
+    """
+    Alpha décroît de BLEND_ALPHA vers 0.55 selon le volume de données RG.
+    SF/F : plancher à 0.80 car trop peu d'exemples, le mini-modèle overfit.
+    """
+    lo, hi = 20, 200
+    if n_rg_matches <= lo:
+        base = BLEND_ALPHA
+    elif n_rg_matches >= hi:
+        base = 0.55
+    else:
+        t = (n_rg_matches - lo) / (hi - lo)
+        base = BLEND_ALPHA - t * (BLEND_ALPHA - 0.55)
+    # SF et Finale : le mini-modèle a trop peu d'exemples → garder le modèle historique dominant
+    if round_number >= 6:
+        return max(0.80, base)
+    return base
+
+
+def predict_proba_a(
+    model,
+    match_features: pd.Series,
+    rg_model=None,
+    feature_cols: list[str] = FEATURE_COLS,
+    alpha: float = BLEND_ALPHA,
+) -> float:
+    """Probabilité que le joueur A gagne, avec blend optionnel."""
+    X = match_features[feature_cols].fillna(0).values.reshape(1, -1)
+    base_p = float(model.predict_proba(X)[0][1])
+    if rg_model is None:
+        return base_p
+    rg_p = float(rg_model.predict_proba(X)[0][1])
+    return alpha * base_p + (1.0 - alpha) * rg_p
+
+
+# ---------------------------------------------------------------------------
+# Backtesting
+# ---------------------------------------------------------------------------
 
 def expanding_window_backtest(
     all_feature_df: pd.DataFrame,
     rg_feature_df: pd.DataFrame,
     rg_years: list[int] | None = None,
     feature_cols: list[str] = FEATURE_COLS,
+    blend_alpha: float = BLEND_ALPHA,
 ) -> list[BacktestResult]:
     """
     Pour chaque édition RG (2017-2025) :
-      - Train : toutes les features clay AVANT le début de ce RG
-      - Test  : features de ce RG uniquement
+      - Modèle de base  : toutes les features clay AVANT ce RG
+      - Blend online    : pour chaque tour R, le mini-modèle est entraîné
+                          sur les matchs des tours < R du MÊME tournoi.
+      - Résultats par tour pour les deux approches.
     """
     if rg_years is None:
         rg_years = list(range(2017, 2026))
 
     results = []
-
     pbar = tqdm(rg_years, desc="Backtest RG", unit="édition", ncols=80)
+
     for year in pbar:
         pbar.set_postfix({"année": year})
-        rg_year_df = rg_feature_df[rg_feature_df["tourney_date"].dt.year == year]
+        rg_year_df = rg_feature_df[rg_feature_df["tourney_date"].dt.year == year].copy()
         if rg_year_df.empty:
             tqdm.write(f"  [WARN] Pas de données RG {year}")
             continue
@@ -101,54 +217,98 @@ def expanding_window_backtest(
             continue
 
         pbar.set_description(f"Backtest RG {year} (train={len(train_df):,})")
-        model = train_model(train_df, feature_cols, calibrate=True)
+        base_model = train_model(train_df, feature_cols, calibrate=True)
 
-        # Prédictions sur le RG de l'année
-        X_test = rg_year_df[feature_cols].fillna(0)
-        y_true = rg_year_df["target"].values
-        probas = model.predict_proba(X_test)[:, 1]
-        preds = (probas >= 0.5).astype(int)
+        # --- Simulation online round par round (tableau principal uniquement) ---
+        rounds = sorted(r for r in rg_year_df["round_number"].unique()
+                        if r in MAIN_DRAW_ROUNDS)
+        rg_seen: list[pd.DataFrame] = []   # matchs RG déjà joués (rounds précédents)
+        by_round_rows: list[dict] = []
+        all_base_proba: list[np.ndarray] = []
+        all_blend_proba: list[np.ndarray] = []
+        all_y: list[np.ndarray] = []
 
-        acc = accuracy_score(y_true, preds)
-        brier = brier_score_loss(y_true, probas)
-        # sklearn raises if only one class is present in `y_true`.
-        # Fournir explicitement les labels permet d'éviter l'erreur
-        # ValueError: y_true contains only one label (1).
-        ll = log_loss(y_true, np.column_stack([1 - probas, probas]), labels=[0, 1])
-
-        # Décomposition par tour
-        by_round_rows = []
-        for rn in sorted(rg_year_df["round_number"].unique()):
+        for rn in rounds:
             mask = rg_year_df["round_number"] == rn
-            sub_X = rg_year_df[mask][feature_cols].fillna(0)
-            sub_y = rg_year_df[mask]["target"].values
-            sub_p = model.predict_proba(sub_X)[:, 1]
+            rn_df = rg_year_df[mask]
+            X_rn = rn_df[feature_cols].fillna(0)
+            y_rn = rn_df["target"].values
+
+            # Proba base
+            base_p = base_model.predict_proba(X_rn)[:, 1]
+
+            # Mini-modèle sur les rounds précédents
+            rg_so_far = pd.concat(rg_seen, ignore_index=True) if rg_seen else pd.DataFrame()
+            n_rg = len(rg_so_far)
+            alpha = dynamic_alpha(n_rg * 2, round_number=rn)
+            mini = train_mini_model(rg_so_far, feature_cols) if not rg_so_far.empty else None
+            blend_p = blend_probas(base_model, mini, X_rn, feature_cols, alpha=alpha)
+
+            # Stats
+            acc_base  = accuracy_score(y_rn, (base_p  >= 0.5).astype(int))
+            brier_base  = brier_score_loss(y_rn, base_p)
+            acc_blend = accuracy_score(y_rn, (blend_p >= 0.5).astype(int))
+            brier_blend = brier_score_loss(y_rn, blend_p)
+
             by_round_rows.append({
-                "round": rn,
-                "accuracy": accuracy_score(sub_y, (sub_p >= 0.5).astype(int)),
-                "brier": brier_score_loss(sub_y, sub_p),
-                "n": int(mask.sum()),
+                "round_number":    rn,
+                "round_name":      ROUND_NAMES.get(rn, str(rn)),
+                "n":               int(mask.sum()),
+                "acc_base":        acc_base,
+                "brier_base":      brier_base,
+                "acc_blend":       acc_blend,
+                "brier_blend":     brier_blend,
+                "rg_matches_used": n_rg,
             })
+
+            all_base_proba.append(base_p)
+            all_blend_proba.append(blend_p)
+            all_y.append(y_rn)
+
+            # Ajouter ce tour aux données RG vues
+            rg_seen.append(rn_df)
+
+        # Métriques globales
+        y_all    = np.concatenate(all_y)
+        base_all = np.concatenate(all_base_proba)
+        blend_all = np.concatenate(all_blend_proba)
+
+        acc   = accuracy_score(y_all, (base_all  >= 0.5).astype(int))
+        brier = brier_score_loss(y_all, base_all)
+        ll    = log_loss(y_all, np.column_stack([1 - base_all, base_all]), labels=[0, 1])
+        acc_bl   = accuracy_score(y_all, (blend_all >= 0.5).astype(int))
+        brier_bl = brier_score_loss(y_all, blend_all)
+        ll_bl    = log_loss(y_all, np.column_stack([1 - blend_all, blend_all]), labels=[0, 1])
 
         results.append(BacktestResult(
             year=year,
-            accuracy=acc,
-            brier=brier,
-            log_loss_val=ll,
+            accuracy=acc, brier=brier, log_loss_val=ll,
             n_matches=len(rg_year_df),
             by_round=pd.DataFrame(by_round_rows),
+            accuracy_blend=acc_bl, brier_blend=brier_bl, log_loss_blend=ll_bl,
         ))
-        tqdm.write(f"  RG {year}: Acc={acc:.3f} | Brier={brier:.4f} | LogLoss={ll:.4f} | n={len(rg_year_df)}")
+        tqdm.write(
+            f"  RG {year}: "
+            f"Base Acc={acc:.3f} Brier={brier:.4f} | "
+            f"Blend Acc={acc_bl:.3f} Brier={brier_bl:.4f}"
+        )
 
     return results
 
 
+# ---------------------------------------------------------------------------
+# Comparaison baselines
+# ---------------------------------------------------------------------------
+
 def compare_baselines(rg_feature_df: pd.DataFrame, all_feature_df: pd.DataFrame) -> pd.DataFrame:
-    """Compare XGBoost vs baselines (ranking, Elo clay, WElo) sur RG 2017-2025."""
+    """Compare XGBoost (base + blend) vs baselines sur RG 2017-2025."""
     rows = []
 
     for year in tqdm(range(2017, 2026), desc="Comparaison baselines", unit="année", ncols=80):
-        rg_y = rg_feature_df[rg_feature_df["tourney_date"].dt.year == year]
+        rg_y = rg_feature_df[
+            (rg_feature_df["tourney_date"].dt.year == year) &
+            (rg_feature_df["round_number"].isin(MAIN_DRAW_ROUNDS))
+        ]
         if rg_y.empty:
             continue
 
@@ -156,30 +316,38 @@ def compare_baselines(rg_feature_df: pd.DataFrame, all_feature_df: pd.DataFrame)
         train_df = all_feature_df[all_feature_df["tourney_date"] < rg_start]
         y_true = rg_y["target"].values
 
-        # Baseline 1 : ranking ATP
+        # Baselines
         rank_proba = 1.0 / (1.0 + np.exp(rg_y["ranking_diff"].fillna(0).values / 50.0))
-        # Baseline 2 : clay Elo
         clay_proba = 1.0 / (1.0 + 10.0 ** (-rg_y["diff_clay_elo"].fillna(0).values / 400.0))
-        # Baseline 3 : WElo ajusté
         welo_proba = 1.0 / (1.0 + 10.0 ** (-rg_y["diff_adjusted_elo"].fillna(0).values / 400.0))
 
-        row = {
+        row: dict = {
             "year": year,
             "n": len(rg_y),
-            "baseline_rank_acc": accuracy_score(y_true, (rank_proba >= 0.5).astype(int)),
-            "baseline_rank_brier": brier_score_loss(y_true, rank_proba),
-            "baseline_clay_elo_acc": accuracy_score(y_true, (clay_proba >= 0.5).astype(int)),
+            "baseline_rank_acc":    accuracy_score(y_true, (rank_proba >= 0.5).astype(int)),
+            "baseline_rank_brier":  brier_score_loss(y_true, rank_proba),
+            "baseline_clay_elo_acc":  accuracy_score(y_true, (clay_proba >= 0.5).astype(int)),
             "baseline_clay_elo_brier": brier_score_loss(y_true, clay_proba),
-            "baseline_welo_adj_acc": accuracy_score(y_true, (welo_proba >= 0.5).astype(int)),
+            "baseline_welo_adj_acc":  accuracy_score(y_true, (welo_proba >= 0.5).astype(int)),
             "baseline_welo_adj_brier": brier_score_loss(y_true, welo_proba),
         }
 
         if len(train_df) >= 100:
-            model = train_model(train_df, FEATURE_COLS, calibrate=True)
+            base_model = train_model(train_df, FEATURE_COLS, calibrate=True)
             X_test = rg_y[FEATURE_COLS].fillna(0)
-            xgb_proba = model.predict_proba(X_test)[:, 1]
-            row["xgboost_acc"] = accuracy_score(y_true, (xgb_proba >= 0.5).astype(int))
-            row["xgboost_brier"] = brier_score_loss(y_true, xgb_proba)
+            xgb_p = base_model.predict_proba(X_test)[:, 1]
+            row["xgboost_acc"]   = accuracy_score(y_true, (xgb_p >= 0.5).astype(int))
+            row["xgboost_brier"] = brier_score_loss(y_true, xgb_p)
+
+            # Blend simulé : mini-modèle sur le RG de l'année précédente
+            prev_rg = rg_feature_df[rg_feature_df["tourney_date"].dt.year == year - 1]
+            if len(prev_rg) >= MIN_RG_FOR_BLEND // 2:
+                mini = train_mini_model(prev_rg, FEATURE_COLS)
+                if mini:
+                    al = dynamic_alpha(len(prev_rg) * 2)
+                    bl_p = blend_probas(base_model, mini, X_test, alpha=al)
+                    row["blend_acc"]   = accuracy_score(y_true, (bl_p >= 0.5).astype(int))
+                    row["blend_brier"] = brier_score_loss(y_true, bl_p)
         else:
             row["xgboost_acc"] = np.nan
             row["xgboost_brier"] = np.nan
@@ -191,8 +359,10 @@ def compare_baselines(rg_feature_df: pd.DataFrame, all_feature_df: pd.DataFrame)
 
 def get_feature_importance(model, feature_cols: list[str] = FEATURE_COLS) -> pd.DataFrame:
     """Retourne l'importance des features (compatible XGBoost natif et CalibratedClassifierCV)."""
-    if hasattr(model, "estimator"):
-        base = model.estimators_[0].estimator if hasattr(model, "estimators_") else model.estimator
+    if hasattr(model, "estimators_"):
+        base = model.estimators_[0].estimator
+    elif hasattr(model, "estimator"):
+        base = model.estimator
     else:
         base = model
     importances = base.feature_importances_
