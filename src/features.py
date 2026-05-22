@@ -155,109 +155,147 @@ class HistoryIndex:
         self.h2h_state = self._build_h2h_state(history)
 
     def _build_player_state(self, history: pd.DataFrame) -> pd.DataFrame:
-        base = ["player", "tourney_date", "surface", "won"]
-        cols = ["tourney_date", "surface", "score", "minutes"] + _SRV_NORM
-        available = [c for c in cols if c in history.columns]
-
-        if not available:
-            return _EMPTY
-
-        long = []
-        # Vue gagnant
+        # --- Format long (gagnant + perdant) ---
         w_cols = ["tourney_date", "surface", "score", "minutes", "winner_name", "loser_name"] + [f"w_{c}" for c in _SRV_NORM]
-        w = history[[c for c in w_cols if c in history.columns]].copy()
-        if not w.empty:
-            w = w.rename(columns={"winner_name": "player", "loser_name": "opponent", **{f"w_{c}": c for c in _SRV_NORM}})
-            w["won"] = True
-            long.append(w)
-
-        # Vue perdant
         l_cols = ["tourney_date", "surface", "score", "minutes", "loser_name", "winner_name"] + [f"l_{c}" for c in _SRV_NORM]
-        l = history[[c for c in l_cols if c in history.columns]].copy()
-        if not l.empty:
-            l = l.rename(columns={"loser_name": "player", "winner_name": "opponent", **{f"l_{c}": c for c in _SRV_NORM}})
-            l["won"] = False
-            long.append(l)
 
-        if not long:
+        w = history[[c for c in w_cols if c in history.columns]].copy()
+        l = history[[c for c in l_cols if c in history.columns]].copy()
+        if w.empty and l.empty:
             return _EMPTY
 
-        df = pd.concat(long, ignore_index=True)
+        w = w.rename(columns={"winner_name": "player", "loser_name": "opponent",
+                               **{f"w_{c}": c for c in _SRV_NORM}})
+        w["won"] = True
+        l = l.rename(columns={"loser_name": "player", "winner_name": "opponent",
+                               **{f"l_{c}": c for c in _SRV_NORM}})
+        l["won"] = False
+
+        df = pd.concat([w, l], ignore_index=True)
         df = df.sort_values(["player", "tourney_date"]).reset_index(drop=True)
 
-        df["won_i"] = df["won"].astype(int)
-        df["match_i"] = 1
-        surface_series = df["surface"] if "surface" in df.columns else pd.Series("", index=df.index)
-        df["is_clay"] = surface_series.eq("Clay").astype(int)
+        df["won_i"]      = df["won"].astype(int)
+        df["is_clay"]    = df["surface"].eq("Clay").astype(int) if "surface" in df.columns else 0
         df["clay_win_i"] = df["won_i"] * df["is_clay"]
-        df["clay_match_i"] = df["is_clay"]
-        df["sets_played"] = _score_to_sets_played(df.get("score", pd.Series(index=df.index, dtype="object")))
-        minutes_series = df["minutes"] if "minutes" in df.columns else pd.Series(0.0, index=df.index)
-        df["minutes"] = pd.to_numeric(minutes_series, errors="coerce").fillna(0.0)
+        df["sets_played"] = _score_to_sets_played(df.get("score", pd.Series(dtype="object")))
+        df["minutes"]    = pd.to_numeric(df.get("minutes", 0), errors="coerce").fillna(0.0)
 
-        numeric_srv = [c for c in _SRV_NORM if c in df.columns]
-        for c in numeric_srv:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+        srv_cols = ["svpt", "1stIn", "1stWon", "bpFaced", "bpSaved"]
+        for c in srv_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        srv_ok = all(c in df.columns for c in srv_cols)
 
-        frames: list[pd.DataFrame] = []
-        for player, g in df.groupby("player", sort=False):
-            g = g.sort_values("tourney_date").copy()
-            g = g.set_index("tourney_date")
+        # --- Pré-allocation numpy (évite 20K DataFrames dans une boucle) ---
+        DAY = np.timedelta64(1, "D")
+        N = len(df)
 
-            g["matches_21d"] = g["match_i"].rolling("21D", closed="left").sum().fillna(0)
-            g["sets_21d"] = g["sets_played"].rolling("21D", closed="left").sum().fillna(0)
-            g["minutes_21d"] = g["minutes"].rolling("21D", closed="left").sum().fillna(0)
+        out_matches_21d    = np.zeros(N)
+        out_sets_21d       = np.zeros(N)
+        out_minutes_21d    = np.zeros(N)
+        out_wr_clay_12m    = np.full(N, 0.5)
+        out_wr_clay_6m     = np.full(N, 0.5)
+        out_wr_30d         = np.full(N, 0.5)
+        out_wr_last10      = np.full(N, 0.5)
+        out_fsp            = np.full(N, 0.6)
+        out_fswp           = np.full(N, 0.7)
+        out_bpsp           = np.full(N, 0.6)
+        out_matches_before = np.zeros(N)
+        out_wins_before    = np.zeros(N)
 
-            clay_matches_12m = g["clay_match_i"].rolling("365D", closed="left").sum()
-            clay_wins_12m = g["clay_win_i"].rolling("365D", closed="left").sum()
-            clay_matches_6m = g["clay_match_i"].rolling("183D", closed="left").sum()
-            clay_wins_6m = g["clay_win_i"].rolling("183D", closed="left").sum()
-            recent_matches_30d = g["match_i"].rolling("30D", closed="left").sum()
-            recent_wins_30d = g["won_i"].rolling("30D", closed="left").sum()
+        # df est déjà trié par (player, tourney_date)
+        player_col = df["player"].values
+        date_col   = df["tourney_date"].values.astype("datetime64[D]")
+        won_col    = df["won_i"].values.astype(float)
+        clay_w_col = df["clay_win_i"].values.astype(float)
+        clay_m_col = df["is_clay"].values.astype(float)
+        sets_col   = df["sets_played"].values.astype(float)
+        mins_col   = df["minutes"].values.astype(float)
 
-            g["win_rate_clay_12m"] = (clay_wins_12m / clay_matches_12m).fillna(0.5)
-            g["win_rate_clay_6m"] = (clay_wins_6m / clay_matches_6m).fillna(0.5)
-            g["win_rate_30d"] = (recent_wins_30d / recent_matches_30d).fillna(0.5)
+        # Colonnes service (optionnelles)
+        if srv_ok:
+            svpt_col  = df["svpt"].values.astype(float)
+            fin_col   = df["1stIn"].values.astype(float)
+            fwon_col  = df["1stWon"].values.astype(float)
+            bpf_col   = df["bpFaced"].values.astype(float)
+            bps_col   = df["bpSaved"].values.astype(float)
 
-            past_wins = g["won_i"].shift(1)
-            g["win_rate_last10"] = past_wins.rolling(10, min_periods=1).mean().fillna(0.5)
+        # Bornes de groupe : une seule itération, O(n) total
+        boundaries = np.where(np.concatenate([[True], player_col[1:] != player_col[:-1], [True]]))[0]
+        for k in range(len(boundaries) - 1):
+            s, e = int(boundaries[k]), int(boundaries[k + 1])
+            n = e - s
+            dates    = date_col[s:e]
+            won_arr  = won_col[s:e]
+            clay_w   = clay_w_col[s:e]
+            clay_m   = clay_m_col[s:e]
+            sets_arr = sets_col[s:e]
+            mins_arr = mins_col[s:e]
 
-            if "svpt" in g.columns and "1stIn" in g.columns and "1stWon" in g.columns and "bpFaced" in g.columns and "bpSaved" in g.columns:
-                svpt = pd.to_numeric(g["svpt"], errors="coerce").fillna(0)
-                first_in = pd.to_numeric(g["1stIn"], errors="coerce").fillna(0)
-                first_won = pd.to_numeric(g["1stWon"], errors="coerce").fillna(0)
-                bp_faced = pd.to_numeric(g["bpFaced"], errors="coerce").fillna(0)
-                bp_saved = pd.to_numeric(g["bpSaved"], errors="coerce").fillna(0)
+            cs_w  = np.empty(n + 1); cs_w[0]  = 0.0; np.cumsum(won_arr,  out=cs_w[1:])
+            cs_cw = np.empty(n + 1); cs_cw[0] = 0.0; np.cumsum(clay_w,   out=cs_cw[1:])
+            cs_cm = np.empty(n + 1); cs_cm[0] = 0.0; np.cumsum(clay_m,   out=cs_cm[1:])
+            cs_s  = np.empty(n + 1); cs_s[0]  = 0.0; np.cumsum(sets_arr, out=cs_s[1:])
+            cs_mn = np.empty(n + 1); cs_mn[0] = 0.0; np.cumsum(mins_arr, out=cs_mn[1:])
+            idx   = np.arange(n)  # end_idx in cs arrays
 
-                svpt_20 = svpt.shift(1).rolling(20, min_periods=1).sum()
-                first_in_20 = first_in.shift(1).rolling(20, min_periods=1).sum()
-                first_won_20 = first_won.shift(1).rolling(20, min_periods=1).sum()
-                bp_faced_20 = bp_faced.shift(1).rolling(20, min_periods=1).sum()
-                bp_saved_20 = bp_saved.shift(1).rolling(20, min_periods=1).sum()
+            def _ws(cs: np.ndarray, days: int) -> np.ndarray:
+                st = np.searchsorted(dates, dates - days * DAY, side="left")
+                return cs[idx] - cs[st]
 
-                g["first_serve_pct"] = _rolling_ratio(first_in_20, svpt_20).fillna(0.6)
-                g["first_serve_won_pct"] = _rolling_ratio(first_won_20, first_in_20).fillna(0.7)
-                g["bp_saved_pct"] = _rolling_ratio(bp_saved_20, bp_faced_20).fillna(0.6)
-            else:
-                g["first_serve_pct"] = 0.6
-                g["first_serve_won_pct"] = 0.7
-                g["bp_saved_pct"] = 0.6
+            out_matches_21d[s:e]    = _ws(np.arange(n + 1, dtype=float), 21)
+            out_sets_21d[s:e]       = _ws(cs_s, 21)
+            out_minutes_21d[s:e]    = _ws(cs_mn, 21)
 
-            g["matches_before"] = g["match_i"].cumsum().shift(1).fillna(0)
-            g["wins_before"] = g["won_i"].cumsum().shift(1).fillna(0)
-            g["player"] = str(player)
+            cw12 = _ws(cs_cw, 365); cm12 = _ws(cs_cm, 365)
+            cw6  = _ws(cs_cw, 183); cm6  = _ws(cs_cm, 183)
+            w30  = _ws(cs_w, 30);   m30  = np.arange(n, dtype=float) - np.searchsorted(dates, dates - 30 * DAY, side="left")
 
-            frames.append(g.reset_index())
+            out_wr_clay_12m[s:e] = np.where(cm12 > 0, cw12 / cm12, 0.5)
+            out_wr_clay_6m[s:e]  = np.where(cm6  > 0, cw6  / cm6,  0.5)
+            out_wr_30d[s:e]      = np.where(m30  > 0, w30  / m30,   0.5)
+            out_matches_before[s:e] = idx.astype(float)
+            out_wins_before[s:e]    = cs_w[idx]
 
-        out = pd.concat(frames, ignore_index=True) if frames else _EMPTY
-        cols = [
-            "player", "tourney_date",
-            "matches_21d", "sets_21d", "minutes_21d",
-            "win_rate_clay_12m", "win_rate_clay_6m", "win_rate_30d", "win_rate_last10",
-            "first_serve_pct", "first_serve_won_pct", "bp_saved_pct",
-            "matches_before", "wins_before",
-        ]
-        return out[cols].sort_values(["player", "tourney_date"]).reset_index(drop=True)
+            # win_rate_last10 via rolling numpy cumsum
+            cs_w_full = np.concatenate([[0.0], np.cumsum(won_arr)])
+            end10 = idx  # cumsum index at position i = # wins in [0, i)
+            st10  = np.maximum(0, idx - 10)
+            cnt10 = idx - st10
+            out_wr_last10[s:e] = np.where(cnt10 > 0,
+                                           (cs_w_full[end10] - cs_w_full[st10]) / cnt10,
+                                           0.5)
+
+            # Service stats via rolling numpy cumsum (shifted: exclude current)
+            if srv_ok:
+                sv = svpt_col[s:e]; fi = fin_col[s:e]
+                fw = fwon_col[s:e]; bf = bpf_col[s:e]; bs = bps_col[s:e]
+                def _srv(arr: np.ndarray, w: int = 20) -> np.ndarray:
+                    cs = np.empty(n + 1); cs[0] = 0.0; np.cumsum(arr, out=cs[1:])
+                    st = np.maximum(0, idx - w)    # shifted: use cs[idx] not cs[idx+1]
+                    return cs[idx] - cs[st]
+                sv20 = _srv(sv); fi20 = _srv(fi); fw20 = _srv(fw); bf20 = _srv(bf); bs20 = _srv(bs)
+                out_fsp[s:e]  = np.where(sv20 > 0, fi20 / sv20, 0.6)
+                out_fswp[s:e] = np.where(fi20 > 0, fw20 / fi20, 0.7)
+                out_bpsp[s:e] = np.where(bf20 > 0, bs20 / bf20, 0.6)
+
+        result = pd.DataFrame({
+            "player":              player_col,
+            "tourney_date":        df["tourney_date"].values,
+            "matches_21d":         out_matches_21d,
+            "sets_21d":            out_sets_21d,
+            "minutes_21d":         out_minutes_21d,
+            "win_rate_clay_12m":   out_wr_clay_12m,
+            "win_rate_clay_6m":    out_wr_clay_6m,
+            "win_rate_30d":        out_wr_30d,
+            "win_rate_last10":     out_wr_last10,
+            "first_serve_pct":     out_fsp,
+            "first_serve_won_pct": out_fswp,
+            "bp_saved_pct":        out_bpsp,
+            "matches_before":      out_matches_before,
+            "wins_before":         out_wins_before,
+        })
+        return result.sort_values(["player", "tourney_date"]).reset_index(drop=True)
 
     def _build_rg_state(self, rg_history: pd.DataFrame) -> pd.DataFrame:
         cols = ["tourney_date", "winner_name", "loser_name", "round"]
@@ -272,21 +310,21 @@ class HistoryIndex:
         long = pd.concat([w, l], ignore_index=True)
         long = long.sort_values(["player", "tourney_date"]).reset_index(drop=True)
         long["won_i"] = long["won"].astype(int)
-        long["rg_match_i"] = 1
-        round_series = long["round"] if "round" in long.columns else pd.Series("R32", index=long.index)
-        long["round_num"] = round_series.map(BEST_ROUND_ENCODING).fillna(3).astype(int)
+        long["round_num"] = long.get("round", pd.Series(dtype=str)).map(BEST_ROUND_ENCODING).fillna(3).astype(int)
 
-        frames: list[pd.DataFrame] = []
-        for player, g in long.groupby("player", sort=False):
-            g = g.sort_values("tourney_date").copy()
-            g["rg_matches"] = g["rg_match_i"].cumsum().shift(1).fillna(0)
-            g["rg_wins"] = g["won_i"].cumsum().shift(1).fillna(0)
-            g["best_round_rg"] = g["round_num"].cummax().shift(1).fillna(1)
-            g["rg_win_rate"] = (g["rg_wins"] / g["rg_matches"]).replace([np.inf, -np.inf], np.nan).fillna(0.5)
-            g["player"] = str(player)
-            frames.append(g[["player", "tourney_date", "rg_win_rate", "rg_matches", "best_round_rg"]])
+        grp = long.groupby("player", sort=False)
+        long["rg_matches"]  = grp.cumcount()
+        cum_wins_rg          = grp["won_i"].transform("cumsum")
+        long["rg_wins"]     = (cum_wins_rg - long["won_i"]).clip(lower=0)
+        # best_round_rg = max tour atteint avant ce match (12K lignes → lambda OK)
+        long["best_round_rg"] = (
+            grp["round_num"]
+            .transform(lambda x: x.shift(1).expanding().max())
+            .fillna(1)
+        )
+        long["rg_win_rate"] = (long["rg_wins"] / long["rg_matches"]).replace([np.inf, -np.inf], np.nan).fillna(0.5)
 
-        return pd.concat(frames, ignore_index=True) if frames else _EMPTY
+        return long[["player", "tourney_date", "rg_win_rate", "rg_matches", "best_round_rg"]].copy()
 
     def _build_h2h_state(self, history: pd.DataFrame) -> pd.DataFrame:
         cols = ["tourney_date", "surface", "winner_name", "loser_name"]
@@ -306,17 +344,19 @@ class HistoryIndex:
         long = long.sort_values(["player", "opponent", "tourney_date"]).reset_index(drop=True)
         long["won_i"] = long["won"].astype(int)
 
-        frames: list[pd.DataFrame] = []
-        for (player, opponent), g in long.groupby(["player", "opponent"], sort=False):
-            g = g.sort_values("tourney_date").copy()
-            g["h2h_clay_wins_a"] = g["won_i"].cumsum().shift(1).fillna(0)
-            g["h2h_clay_total"] = np.arange(len(g))
-            g["h2h_clay_rate"] = np.where(g["h2h_clay_total"] >= 3, g["h2h_clay_wins_a"] / g["h2h_clay_total"], 0.5)
-            g["player"] = str(player)
-            g["opponent"] = str(opponent)
-            frames.append(g[["player", "opponent", "tourney_date", "h2h_clay_wins_a", "h2h_clay_total", "h2h_clay_rate"]])
+        # Vectorisé : Cython natif, pas de lambda Python
+        long["h2h_clay_total"]    = long.groupby(["player", "opponent"]).cumcount()
+        cum_wins                   = long.groupby(["player", "opponent"])["won_i"].transform("cumsum")
+        long["h2h_clay_wins_a"]   = (cum_wins - long["won_i"]).clip(lower=0)
+        total_safe                 = long["h2h_clay_total"].replace(0, np.nan)
+        long["h2h_clay_rate"] = np.where(
+            long["h2h_clay_total"] >= 3,
+            long["h2h_clay_wins_a"] / total_safe,
+            0.5,
+        )
 
-        return pd.concat(frames, ignore_index=True) if frames else _EMPTY
+        return long[["player", "opponent", "tourney_date",
+                      "h2h_clay_wins_a", "h2h_clay_total", "h2h_clay_rate"]].copy()
 
     # ------------------------------------------------------------------
     # Lookups (toutes O(n_joueur))
@@ -454,7 +494,8 @@ def build_features(
 
     base = df.copy()
     base["tourney_date"] = pd.to_datetime(base["tourney_date"])
-    base = base.sort_values(["tourney_date", "tourney_id", "round_number"]).reset_index(drop=True)
+    sort_by = ["tourney_date"] + [c for c in ["tourney_id", "round_number"] if c in base.columns]
+    base = base.sort_values(sort_by).reset_index(drop=True)
     base["player_a"] = base["winner_name"]
     base["player_b"] = base["loser_name"]
     base["target"] = 1

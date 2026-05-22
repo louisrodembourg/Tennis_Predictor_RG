@@ -89,20 +89,25 @@ class RolandGarrosPredictor:
 
         winner = player_a if proba_a >= 0.5 else player_b
 
-        if abs(proba_a - 0.5) > 0.2:
+        gap = abs(proba_a - 0.5)
+        if gap > 0.2:
             confidence = "haute"
-        elif abs(proba_a - 0.5) > 0.1:
+        elif gap > 0.1:
             confidence = "moyenne"
         else:
             confidence = "faible"
 
-        top_features = self._get_top_features(features)
+        # Score numérique 0-100 : 0 = match parfaitement incertain, 100 = certitude absolue
+        confidence_score = round(gap * 200, 1)
+
+        top_features = self._get_top_features(features, player_a, player_b)
 
         return {
             "winner_predicted": winner,
             "proba_a": round(proba_a, 4),
             "proba_b": round(proba_b, 4),
             "confidence": confidence,
+            "confidence_score": confidence_score,
             "top_features": top_features,
         }
 
@@ -112,16 +117,18 @@ class RolandGarrosPredictor:
         loser: str,
         score: str,
         round_number: int,
+        match_date: str = "2026-05-25",
     ) -> dict:
         """
         Enregistre un résultat RG 2026, met à jour les Elo et réentraîne le modèle.
+        round_number < 1 = qualifications (fatigue trackée, pas dans le tableau principal).
         """
         result = {
             "winner": winner,
             "loser": loser,
             "score": score,
             "round_number": round_number,
-            "tourney_date": "2026-05-25",
+            "tourney_date": match_date,
         }
         self._apply_result(result, retrain=True)
         self._save_rg2026_result(result)
@@ -292,8 +299,33 @@ class RolandGarrosPredictor:
             return None
         return feat_df.iloc[0]
 
-    def _get_top_features(self, features: pd.Series, top_n: int = 5) -> list[dict]:
-        """Top features les plus influentes (basé sur importances du modèle)."""
+    def _get_top_features(
+        self, features: pd.Series, player_a: str, player_b: str, top_n: int = 5
+    ) -> list[dict]:
+        """Top features les plus influentes avec direction (faveur A ou B)."""
+        _FEATURE_LABELS = {
+            "diff_standard_elo": "Elo standard",
+            "diff_clay_elo": "Elo clay",
+            "diff_welo": "WElo",
+            "diff_adjusted_elo": "Elo ajusté",
+            "diff_win_rate_clay_12m": "Win rate clay 12 mois",
+            "diff_win_rate_clay_6m": "Win rate clay 6 mois",
+            "diff_win_rate_30d": "Win rate 30 jours",
+            "diff_matches_21d": "Matchs 21 jours (fatigue)",
+            "diff_sets_21d": "Sets 21 jours (fatigue)",
+            "diff_minutes_21d": "Minutes 21 jours (fatigue)",
+            "diff_win_rate_last10": "Win rate 10 derniers matchs",
+            "h2h_clay_rate": "H2H clay",
+            "diff_rg_win_rate": "Win rate Roland Garros",
+            "diff_best_round_rg": "Meilleur tour RG",
+            "ranking_diff": "Classement ATP",
+            "log_ranking_diff": "Classement (log)",
+            "diff_first_serve_pct": "% 1er service",
+            "diff_first_serve_won_pct": "% pts gagnés sur 1er service",
+            "diff_bp_saved_pct": "% balles de break sauvées",
+            "round_number": "Tour du tournoi",
+            "diff_sets_played_rg": "Sets joués ce RG (intra-tournoi)",
+        }
         try:
             base_model = self.model
             if hasattr(base_model, "estimators_"):
@@ -304,15 +336,39 @@ class RolandGarrosPredictor:
                 importances = base_model.feature_importances_
 
             top_idx = np.argsort(importances)[::-1][:top_n]
-            return [
-                {
-                    "feature": FEATURE_COLS[i],
-                    "value": round(float(features.get(FEATURE_COLS[i], 0)), 4),
+            result = []
+            for i in top_idx:
+                if i >= len(FEATURE_COLS):
+                    continue
+                col = FEATURE_COLS[i]
+                val = float(features.get(col, 0) or 0)
+                # Pour les features "diff_*" et ranking_diff : positif = avantage A
+                # Pour h2h_clay_rate : > 0.5 = avantage A
+                # Pour round_number : neutre
+                if col in ("round_number", "h2h_clay_total", "rg_matches_a", "rg_matches_b",
+                           "matches_21d_a", "matches_21d_b", "sets_21d_a", "sets_21d_b",
+                           "age_a", "age_b"):
+                    favors = "neutre"
+                elif col == "h2h_clay_rate":
+                    favors = player_a if val > 0.5 else (player_b if val < 0.5 else "neutre")
+                elif col == "diff_matches_21d":
+                    # Plus de matchs = plus de fatigue = désavantage
+                    favors = player_b if val > 0 else (player_a if val < 0 else "neutre")
+                elif col == "diff_sets_21d" or col == "diff_minutes_21d":
+                    favors = player_b if val > 0 else (player_a if val < 0 else "neutre")
+                elif col == "ranking_diff":
+                    # ranking_diff = rank_a - rank_b ; rang plus bas = meilleur
+                    favors = player_b if val > 0 else (player_a if val < 0 else "neutre")
+                else:
+                    favors = player_a if val > 0 else (player_b if val < 0 else "neutre")
+
+                result.append({
+                    "feature": _FEATURE_LABELS.get(col, col),
+                    "value": round(val, 4),
                     "importance": round(float(importances[i]), 4),
-                }
-                for i in top_idx
-                if i < len(FEATURE_COLS)
-            ]
+                    "favors": favors,
+                })
+            return result
         except Exception:
             return []
 
