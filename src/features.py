@@ -136,6 +136,8 @@ class HistoryIndex:
         """Index léger sur les matchs Roland Garros uniquement."""
         cols = ["tourney_date", "winner_name", "loser_name", "round"]
         rg = rg_history[[c for c in cols if c in rg_history.columns]].copy()
+        if rg.empty:
+            return
 
         w = rg.rename(columns={"winner_name": "player", "loser_name": "opponent"})
         w["won"] = True
@@ -172,13 +174,18 @@ class HistoryIndex:
         l["won"] = False
 
         df = pd.concat([w, l], ignore_index=True)
-        df = df.sort_values(["player", "tourney_date"]).reset_index(drop=True)
+        sort_cols = ["player", "tourney_date"]
+        for extra in ["round_number", "match_num"]:
+            if extra in df.columns:
+                sort_cols.append(extra)
+        df = df.sort_values(sort_cols).reset_index(drop=True)
 
         df["won_i"]      = df["won"].astype(int)
         df["is_clay"]    = df["surface"].eq("Clay").astype(int) if "surface" in df.columns else 0
         df["clay_win_i"] = df["won_i"] * df["is_clay"]
         df["sets_played"] = _score_to_sets_played(df.get("score", pd.Series(dtype="object")))
-        df["minutes"]    = pd.to_numeric(df.get("minutes", 0), errors="coerce").fillna(0.0)
+        _min_raw = df["minutes"] if "minutes" in df.columns else pd.Series(0.0, index=df.index)
+        df["minutes"] = pd.to_numeric(_min_raw, errors="coerce").fillna(0.0)
 
         srv_cols = ["svpt", "1stIn", "1stWon", "bpFaced", "bpSaved"]
         for c in srv_cols:
@@ -309,9 +316,9 @@ class HistoryIndex:
         l = rg.rename(columns={"loser_name": "player", "winner_name": "opponent"})
         l["won"] = False
         long = pd.concat([w, l], ignore_index=True)
-        long = long.sort_values(["player", "tourney_date"]).reset_index(drop=True)
-        long["won_i"] = long["won"].astype(int)
         long["round_num"] = long.get("round", pd.Series(dtype=str)).map(BEST_ROUND_ENCODING).fillna(3).astype(int)
+        long = long.sort_values(["player", "tourney_date", "round_num"]).reset_index(drop=True)
+        long["won_i"] = long["won"].astype(int)
 
         grp = long.groupby("player", sort=False)
         long["rg_matches"]  = grp.cumcount()
@@ -701,15 +708,25 @@ def build_symmetric_dataset(feature_df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 FEATURE_COLS = [
-    "diff_standard_elo", "diff_clay_elo", "diff_welo", "diff_adjusted_elo",
+    # Elo : 2 features indépendantes (ajusté + welo), les autres sont redondantes (corr >0.96)
+    "diff_adjusted_elo", "diff_welo",
+    # Form récente
     "diff_win_rate_clay_12m", "diff_win_rate_clay_6m", "diff_win_rate_30d",
-    "diff_matches_21d", "diff_sets_21d", "diff_minutes_21d", "diff_win_rate_last10",
-    "matches_21d_a", "matches_21d_b", "sets_21d_a", "sets_21d_b", "minutes_21d_a", "minutes_21d_b",
+    "diff_win_rate_last10",
+    # Fatigue / charge de matchs (features les plus importantes)
+    "diff_matches_21d", "diff_sets_21d", "diff_minutes_21d",
+    "matches_21d_a", "matches_21d_b", "sets_21d_a", "sets_21d_b",
+    "minutes_21d_a", "minutes_21d_b",
+    # H2H clay
     "h2h_clay_rate", "h2h_clay_total",
-    "diff_rg_win_rate", "rg_matches_a", "rg_matches_b",
-    "diff_best_round_rg",
+    # Performance Roland Garros
+    "diff_rg_win_rate", "rg_matches_a", "rg_matches_b", "diff_best_round_rg",
+    # Classement ATP
     "ranking_diff", "log_ranking_diff",
-    "age_a", "age_b", "diff_age_optimal",
-    "diff_first_serve_pct", "diff_first_serve_won_pct", "diff_bp_saved_pct",
+    # Âge
+    "age_a", "age_b",
+    # Service (signal faible mais non nul)
+    "diff_first_serve_won_pct", "diff_bp_saved_pct",
+    # Contexte tournoi
     "round_number", "diff_sets_played_rg",
 ]

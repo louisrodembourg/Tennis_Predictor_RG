@@ -182,12 +182,27 @@ def predict_proba_a(
 # Backtesting
 # ---------------------------------------------------------------------------
 
+def _intra_rg_sets_from_raw(rg_raw: pd.DataFrame) -> dict[str, int]:
+    """Construit le dict {joueur: sets_joués} depuis les matchs bruts précédents."""
+    if rg_raw.empty or "score" not in rg_raw.columns:
+        return {}
+    import re
+    intra: dict[str, int] = {}
+    scores = rg_raw["score"].fillna("").astype(str)
+    for i, row in enumerate(rg_raw.itertuples(index=False)):
+        n_sets = len(re.findall(r"\d+\s*-\s*\d+", scores.iloc[i]))
+        for player in [row.winner_name, row.loser_name]:
+            intra[player] = intra.get(player, 0) + n_sets
+    return intra
+
+
 def expanding_window_backtest(
     all_feature_df: pd.DataFrame,
     rg_feature_df: pd.DataFrame,
     rg_years: list[int] | None = None,
     feature_cols: list[str] = FEATURE_COLS,
     blend_alpha: float = BLEND_ALPHA,
+    rg_raw_df: Optional[pd.DataFrame] = None,
 ) -> list[BacktestResult]:
     """
     Pour chaque édition RG (2017-2025) :
@@ -228,9 +243,24 @@ def expanding_window_backtest(
         all_blend_proba: list[np.ndarray] = []
         all_y: list[np.ndarray] = []
 
+        # Matchs bruts de l'année pour diff_sets_played_rg (si fournis)
+        rg_raw_year: pd.DataFrame = pd.DataFrame()
+        if rg_raw_df is not None:
+            rg_raw_year = rg_raw_df[rg_raw_df["tourney_date"].dt.year == year].copy()
+
         for rn in rounds:
             mask = rg_year_df["round_number"] == rn
-            rn_df = rg_year_df[mask]
+            rn_df = rg_year_df[mask].copy()
+
+            # Mise à jour de diff_sets_played_rg depuis les matchs bruts précédents
+            if not rg_raw_year.empty:
+                prev_raw = rg_raw_year[rg_raw_year["round_number"] < rn]
+                intra = _intra_rg_sets_from_raw(prev_raw)
+                if intra and "diff_sets_played_rg" in rn_df.columns:
+                    sets_a = rn_df["player_a"].map(lambda p: intra.get(p, 0))
+                    sets_b = rn_df["player_b"].map(lambda p: intra.get(p, 0))
+                    rn_df["diff_sets_played_rg"] = sets_a.values - sets_b.values
+
             X_rn = rn_df[feature_cols].fillna(0)
             y_rn = rn_df["target"].values
 
@@ -283,7 +313,7 @@ def expanding_window_backtest(
         results.append(BacktestResult(
             year=year,
             accuracy=acc, brier=brier, log_loss_val=ll,
-            n_matches=len(rg_year_df),
+            n_matches=len(y_all),   # matchs tableau principal uniquement (hors qualifs)
             by_round=pd.DataFrame(by_round_rows),
             accuracy_blend=acc_bl, brier_blend=brier_bl, log_loss_blend=ll_bl,
         ))

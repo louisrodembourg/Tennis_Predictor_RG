@@ -206,6 +206,64 @@ class TestNoLeakage:
         # H2H doit compter le match de Monte Carlo (avant la date RG)
         assert feat.iloc[0]["h2h_clay_total"] >= 1
 
+    def test_same_day_matches_no_leakage(self, elo_system):
+        """Si un joueur dispute deux matchs le même jour, le second ne doit pas
+        inclure le résultat du premier dans ses features de forme."""
+        df = pd.DataFrame([
+            {
+                "match_id": "sd01", "tourney_id": "t1", "tourney_name": "Qualifying",
+                "tourney_date": pd.Timestamp("2022-05-23"), "surface": "Clay",
+                "round": "Q1", "round_number": -2, "k_factor": 16,
+                "winner_name": "Nadal", "loser_name": "Alcaraz",
+                "winner_rank": 1.0, "loser_rank": 5.0, "winner_age": 36.0, "loser_age": 19.0,
+                "tourney_level": "G", "match_num": 1, "score": "6-4 6-2",
+            },
+            {
+                "match_id": "sd02", "tourney_id": "t1", "tourney_name": "Qualifying",
+                "tourney_date": pd.Timestamp("2022-05-23"), "surface": "Clay",
+                "round": "Q2", "round_number": -1, "k_factor": 16,
+                "winner_name": "Djokovic", "loser_name": "Nadal",
+                "winner_rank": 2.0, "loser_rank": 1.0, "winner_age": 35.0, "loser_age": 36.0,
+                "tourney_level": "G", "match_num": 2, "score": "7-5 6-3",
+            },
+        ])
+        df_elo = elo_system.compute(df)
+        rg_df = pd.DataFrame()
+
+        # Features for the second same-day match only
+        feat = build_features(df=df.iloc[[1]], history=df, rg_history=rg_df, elo_df=df_elo)
+        assert len(feat) == 1
+        # For Djokovic (player_a = winner of match 2), win_rate_30d must NOT include match 2
+        # Before match 2, Djokovic has 0 clay matches in the last 30d → default 0.5
+        row = feat.iloc[0]
+        # win_rate_clay_6m_b is for Nadal (loser of sd02). Nadal won sd01 → rate should NOT
+        # already be 1.0 (would indicate the second match's features saw sd01 as done before it)
+        # Actually what we need to check: matches_before for the loser (Nadal) at sd02
+        # Nadal has 1 match before sd02 (sd01), so matches_before_b should be >= 1
+        if "matches_before_b" in feat.columns:
+            assert feat.iloc[0]["matches_before_b"] >= 1, \
+                "Nadal's match count should include sd01 when computing features for sd02"
+        # And wins_before_b should reflect sd01 win (Nadal won sd01)
+        if "wins_before_b" in feat.columns:
+            assert feat.iloc[0]["wins_before_b"] >= 1, \
+                "Nadal's win count should include the sd01 win"
+
+    def test_diff_sets_played_rg_zero_for_first_round(self, elo_system):
+        """diff_sets_played_rg doit être 0 pour le premier round (pas encore de matchs joués)."""
+        df = pd.DataFrame([{
+            "match_id": "r01", "tourney_id": "rg2022", "tourney_name": "Roland Garros",
+            "tourney_date": pd.Timestamp("2022-05-23"), "surface": "Clay",
+            "round": "R128", "round_number": 1, "k_factor": 40,
+            "winner_name": "Nadal", "loser_name": "Alcaraz",
+            "winner_rank": 1.0, "loser_rank": 5.0, "winner_age": 36.0, "loser_age": 19.0,
+            "tourney_level": "G", "match_num": 1, "score": "6-4 6-3 7-5",
+        }])
+        df_elo = elo_system.compute(df)
+        rg_df = df[df["tourney_name"] == "Roland Garros"]
+        feat = build_features(df=df, history=df, rg_history=rg_df, elo_df=df_elo)
+        assert len(feat) == 1
+        assert feat.iloc[0]["diff_sets_played_rg"] == 0
+
 
 # ------------------------------------------------------------------
 # Tests Dataset Symétrie

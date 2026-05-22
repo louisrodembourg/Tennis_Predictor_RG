@@ -65,8 +65,10 @@ def run_full_backtest(data_dir: str, year_start: int = 2000) -> dict:
         df_elo   = cached["df_with_elo"]
         rg_df    = filter_roland_garros(df)
         all_feat = cached["all_features"]
+        # Exclure les qualifications du jeu d'entraînement (dynamiques trop différentes)
+        all_feat = all_feat[all_feat["round_number"] >= 1].copy()
         hist_index = _index_from_cache(cached)
-        tqdm.write(f"       {len(df):,} matchs — features clay {len(all_feat):,} lignes")
+        tqdm.write(f"       {len(df):,} matchs — features clay {len(all_feat):,} lignes (hors qualifs)")
     else:
         # ---------------------------------------------------------------
         # Chemin complet (premier lancement ou cache invalidé)
@@ -92,7 +94,8 @@ def run_full_backtest(data_dir: str, year_start: int = 2000) -> dict:
             df=clay_with_elo, history=df, rg_history=rg_df,
             elo_df=df_elo, desc="  Features clay", index=hist_index,
         )
-        _done(t, f"{len(all_feat):,} lignes × {all_feat.shape[1]} colonnes")
+        all_feat = all_feat[all_feat["round_number"] >= 1].copy()
+        _done(t, f"{len(all_feat):,} lignes × {all_feat.shape[1]} colonnes (hors qualifs)")
 
     # [5] Features RG — toujours recalculées (légères, ~1 500 matchs)
     rg_with_elo = df_elo[
@@ -107,7 +110,7 @@ def run_full_backtest(data_dir: str, year_start: int = 2000) -> dict:
 
     # [6] Expanding window backtest
     t = _step(6, "Expanding window backtesting (RG 2017-2025)")
-    results = expanding_window_backtest(all_feat, rg_feat)
+    results = expanding_window_backtest(all_feat, rg_feat, rg_raw_df=rg_with_elo)
     _done(t, f"{len(results)} éditions évaluées")
 
     # [7] Comparaison baselines

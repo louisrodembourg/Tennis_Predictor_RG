@@ -40,6 +40,7 @@ class RolandGarrosPredictor:
             self.clay_df     = filter_clay(self.df)
             self.rg_df       = filter_roland_garros(self.df)
             self._feature_df = cached["all_features"]
+            self._feature_df = self._feature_df[self._feature_df["round_number"] >= 1].copy()
             self.model       = cached["model"]
 
             # Reconstruire EloSystem à partir de l'état persisté
@@ -73,6 +74,8 @@ class RolandGarrosPredictor:
 
             print("Construction des features...")
             self._feature_df = self._build_all_features()
+            # Exclure les qualifications de l'entraînement
+            self._feature_df = self._feature_df[self._feature_df["round_number"] >= 1].copy()
 
             print("Entraînement du modèle initial...")
             self.model = train_model(self._feature_df, FEATURE_COLS)
