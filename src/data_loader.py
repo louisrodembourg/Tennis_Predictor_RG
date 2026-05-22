@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 
 COLS_TO_KEEP = [
@@ -56,16 +57,15 @@ def load_matches(data_dir: str, year_start: int = 2000, year_end: int = 2025) ->
             "Lancez d'abord : bash scripts/download_data.sh"
         )
 
+    files_in_range = [f for f in files if year_start <= int(Path(f).stem.split("_")[-1]) <= year_end]
     dfs = []
-    for f in files:
-        year = int(Path(f).stem.split("_")[-1])
-        if year_start <= year <= year_end:
-            try:
-                df = pd.read_csv(f, low_memory=False)
-                df["year"] = year
-                dfs.append(df)
-            except Exception as e:
-                print(f"  [WARN] Impossible de charger {f}: {e}")
+    for f in tqdm(files_in_range, desc="Chargement CSV", unit="fichier", ncols=80):
+        try:
+            df = pd.read_csv(f, low_memory=False)
+            df["year"] = int(Path(f).stem.split("_")[-1])
+            dfs.append(df)
+        except Exception as e:
+            tqdm.write(f"  [WARN] Impossible de charger {f}: {e}")
 
     if not dfs:
         raise ValueError(f"Aucune donnée chargée pour {year_start}-{year_end}.")

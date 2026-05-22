@@ -10,6 +10,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 
 ELO_INIT = 1500.0
@@ -100,7 +101,7 @@ class EloSystem:
         self._ratings.clear()
 
         records = []
-        for _, row in df.iterrows():
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Calcul Elo", unit="match", ncols=80):
             w, l = row["winner_name"], row["loser_name"]
             surface = row.get("surface", "Hard")
             k = float(row.get("k_factor", ELO_K_DEFAULT))

@@ -15,7 +15,7 @@ import pandas as pd
 
 from data_loader import filter_clay, filter_roland_garros, load_matches
 from elo import EloSystem
-from features import FEATURE_COLS, build_features, build_symmetric_dataset
+from features import FEATURE_COLS, HistoryIndex, build_features, build_symmetric_dataset
 from model import XGB_PARAMS, train_model
 
 
@@ -39,6 +39,10 @@ class RolandGarrosPredictor:
         print("Calcul des ratings Elo...")
         self.elo = EloSystem(alpha=alpha, lambda_adj=lambda_adj)
         self.df_with_elo = self.elo.compute(self.df)
+
+        # Index construit une seule fois et réutilisé pour toutes les lookups
+        print("Construction de l'index historique...")
+        self._hist_index = HistoryIndex(self.df, self.rg_df)
 
         print("Construction des features...")
         self._feature_df = self._build_all_features()
@@ -228,6 +232,7 @@ class RolandGarrosPredictor:
             history=self.df,
             rg_history=self.rg_df,
             elo_df=self.df_with_elo,
+            index=self._hist_index,
         )
 
     def _compute_match_features(
@@ -280,6 +285,7 @@ class RolandGarrosPredictor:
             rg_history=self.rg_df,
             elo_df=elo_row,
             intra_rg=self._intra_rg,
+            index=self._hist_index,
         )
 
         if feat_df.empty:
@@ -369,6 +375,7 @@ class RolandGarrosPredictor:
             rg_history=self.rg_df,
             elo_df=None,
             intra_rg=self._intra_rg,
+            index=self._hist_index,
         )
 
     def _get_rank(self, player: str) -> float:

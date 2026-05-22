@@ -9,6 +9,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
     accuracy_score,
@@ -85,19 +86,22 @@ def expanding_window_backtest(
 
     results = []
 
-    for year in rg_years:
+    pbar = tqdm(rg_years, desc="Backtest RG", unit="édition", ncols=80)
+    for year in pbar:
+        pbar.set_postfix({"année": year})
         rg_year_df = rg_feature_df[rg_feature_df["tourney_date"].dt.year == year]
         if rg_year_df.empty:
-            print(f"  [WARN] Pas de données RG {year}")
+            tqdm.write(f"  [WARN] Pas de données RG {year}")
             continue
 
         rg_start = rg_year_df["tourney_date"].min()
         train_df = all_feature_df[all_feature_df["tourney_date"] < rg_start]
 
         if len(train_df) < 100:
-            print(f"  [WARN] Trop peu de données d'entraînement pour RG {year}")
+            tqdm.write(f"  [WARN] Trop peu de données d'entraînement pour RG {year}")
             continue
 
+        pbar.set_description(f"Backtest RG {year} (train={len(train_df):,})")
         model = train_model(train_df, feature_cols, calibrate=True)
 
         # Prédictions sur le RG de l'année
@@ -108,7 +112,10 @@ def expanding_window_backtest(
 
         acc = accuracy_score(y_true, preds)
         brier = brier_score_loss(y_true, probas)
-        ll = log_loss(y_true, np.column_stack([1 - probas, probas]))
+        # sklearn raises if only one class is present in `y_true`.
+        # Fournir explicitement les labels permet d'éviter l'erreur
+        # ValueError: y_true contains only one label (1).
+        ll = log_loss(y_true, np.column_stack([1 - probas, probas]), labels=[0, 1])
 
         # Décomposition par tour
         by_round_rows = []
@@ -132,7 +139,7 @@ def expanding_window_backtest(
             n_matches=len(rg_year_df),
             by_round=pd.DataFrame(by_round_rows),
         ))
-        print(f"RG {year}: Acc={acc:.3f} | Brier={brier:.4f} | LogLoss={ll:.4f} | n={len(rg_year_df)}")
+        tqdm.write(f"  RG {year}: Acc={acc:.3f} | Brier={brier:.4f} | LogLoss={ll:.4f} | n={len(rg_year_df)}")
 
     return results
 
@@ -141,7 +148,7 @@ def compare_baselines(rg_feature_df: pd.DataFrame, all_feature_df: pd.DataFrame)
     """Compare XGBoost vs baselines (ranking, Elo clay, WElo) sur RG 2017-2025."""
     rows = []
 
-    for year in range(2017, 2026):
+    for year in tqdm(range(2017, 2026), desc="Comparaison baselines", unit="année", ncols=80):
         rg_y = rg_feature_df[rg_feature_df["tourney_date"].dt.year == year]
         if rg_y.empty:
             continue

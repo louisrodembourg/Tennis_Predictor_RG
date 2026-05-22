@@ -5,17 +5,33 @@ Module de backtesting standalone — évaluation sur RG 2017-2025.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data_loader import filter_clay, filter_roland_garros, load_matches
 from elo import EloSystem
-from features import FEATURE_COLS, build_features
+from features import FEATURE_COLS, HistoryIndex, build_features
 from model import BacktestResult, compare_baselines, expanding_window_backtest
+
+
+STEPS_TOTAL = 7
+
+
+def _step(n: int, label: str) -> float:
+    tqdm.write(f"\n[{n}/{STEPS_TOTAL}] {label}...")
+    return time.time()
+
+
+def _done(t0: float, detail: str = "") -> None:
+    elapsed = time.time() - t0
+    suffix = f"  ({detail})" if detail else ""
+    tqdm.write(f"      ✓ {elapsed:.1f}s{suffix}")
 
 
 def run_full_backtest(data_dir: str, year_start: int = 2000) -> dict:
@@ -24,47 +40,69 @@ def run_full_backtest(data_dir: str, year_start: int = 2000) -> dict:
     Retourne un dict avec les résultats et le DataFrame de comparaison.
     """
     print("=" * 60)
-    print("BACKTESTING ROLAND GARROS 2017-2025")
+    print("  BACKTESTING ROLAND GARROS 2017-2025")
     print("=" * 60)
 
-    # Chargement
+    # [1/6] Chargement
+    t = _step(1, "Chargement des données ATP")
     df = load_matches(data_dir, year_start=year_start)
     clay_df = filter_clay(df)
     rg_df = filter_roland_garros(df)
+    _done(t, f"{len(df):,} matchs — {len(clay_df):,} clay — {len(rg_df):,} RG")
 
-    # Elo
-    print("\nCalcul des ratings Elo...")
+    # [2/6] Elo
+    t = _step(2, "Calcul des ratings Elo (Standard / Surface / WElo / Adjusted)")
     elo = EloSystem(alpha=0.3, lambda_adj=0.5)
     df_elo = elo.compute(df)
+    _done(t, f"{len(elo._ratings):,} joueurs indexés")
 
-    # Features tous matchs clay
-    print("Construction des features (matchs clay)...")
+    # [3/6] Index historique (construit une seule fois, réutilisé pour clay + RG)
+    t = _step(3, f"Construction de l'index historique ({len(df):,} matchs × 2 joueurs)")
+    hist_index = HistoryIndex(df, rg_df)
+    n_indexed = len(hist_index._players)
+    _done(t, f"{n_indexed:,} joueurs indexés")
+
+    # [4/6] Features clay
     clay_with_elo = df_elo[df_elo["surface"] == "Clay"].copy()
+    t = _step(4, f"Construction features — matchs clay ({len(clay_with_elo):,} matchs)")
     all_feat = build_features(
         df=clay_with_elo,
         history=df,
         rg_history=rg_df,
         elo_df=df_elo,
+        desc="  Features clay",
+        index=hist_index,          # réutilise l'index pré-calculé
     )
+    _done(t, f"{len(all_feat):,} lignes × {all_feat.shape[1]} colonnes")
 
-    # Features RG seulement
+    # [5/6] Features RG  (même index, pas de reconstruction)
     rg_with_elo = df_elo[
         df_elo["tourney_name"].str.contains("Roland Garros|French Open", case=False, na=False)
     ].copy()
+    t = _step(5, f"Construction features — Roland Garros ({len(rg_with_elo):,} matchs)")
     rg_feat = build_features(
         df=rg_with_elo,
         history=df,
         rg_history=rg_df,
         elo_df=df_elo,
+        desc="  Features RG  ",
+        index=hist_index,          # réutilise le même index
     )
+    _done(t, f"{len(rg_feat):,} matchs RG ({rg_feat['tourney_date'].dt.year.min()}–{rg_feat['tourney_date'].dt.year.max()})")
 
-    # Backtesting expanding window
-    print("\nExpanding window backtesting...")
+    # [6/7] Expanding window backtest
+    t = _step(6, "Expanding window backtesting (RG 2017-2025)")
     results = expanding_window_backtest(all_feat, rg_feat)
+    _done(t, f"{len(results)} éditions évaluées")
 
-    # Comparaison baselines
-    print("\nComparaison avec les baselines...")
+    # [7/7] Comparaison baselines
+    t = _step(7, "Comparaison avec les baselines (Ranking / Clay Elo / WElo / XGBoost)")
     baseline_df = compare_baselines(rg_feat, all_feat)
+    _done(t)
+
+    tqdm.write("\n" + "=" * 60)
+    tqdm.write("  Pipeline terminé.")
+    tqdm.write("=" * 60)
 
     return {
         "backtest_results": results,
