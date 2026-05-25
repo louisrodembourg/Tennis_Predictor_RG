@@ -17,7 +17,8 @@ from cache_manager import load_cache, save_cache
 from data_loader import filter_clay, filter_roland_garros, load_matches
 from elo import EloSystem
 from features import FEATURE_COLS, HistoryIndex, build_features, build_symmetric_dataset
-from model import XGB_PARAMS, train_model, train_mini_model, dynamic_alpha
+from conformal import ConformalPredictor
+from model import XGB_PARAMS, TEMPORAL_LAMBDA, train_model, train_mini_model, dynamic_alpha
 
 
 class RolandGarrosPredictor:
@@ -90,6 +91,17 @@ class RolandGarrosPredictor:
                 "model":        self.model,
             })
 
+        # Conformal predictor (calibré si données disponibles)
+        self._conformal = ConformalPredictor(coverage=0.80)
+        _cal_path = Path(__file__).parent.parent / "data" / "cache" / "conformal_cal.parquet"
+        if _cal_path.exists():
+            try:
+                _cal_df = pd.read_parquet(_cal_path)
+                self._conformal.calibrate(_cal_df)
+                print(f"  Conformal q_hat={self._conformal.q_hat:.3f} (calibré sur {len(_cal_df)} matchs)")
+            except Exception as _e:
+                print(f"  [WARN] Conformal calibration échouée : {_e}")
+
         # État intra-tournoi RG 2026 (toujours rechargé depuis le JSONL)
         self._intra_rg: dict[str, dict] = {}
         self._rg_model = None                                # mini-modèle RG 2026
@@ -146,6 +158,7 @@ class RolandGarrosPredictor:
         confidence_score = round(gap * 200, 1)
 
         top_features = self._get_top_features(features, player_a, player_b)
+        p_low, p_high = self._conformal.predict_interval(proba_a)
 
         return {
             "winner_predicted": winner,
@@ -154,6 +167,9 @@ class RolandGarrosPredictor:
             "confidence": confidence,
             "confidence_score": confidence_score,
             "top_features": top_features,
+            "proba_a_low":  round(p_low,  4),
+            "proba_a_high": round(p_high, 4),
+            "conformal_calibrated": self._conformal.is_calibrated,
         }
 
     def add_result(
@@ -175,11 +191,15 @@ class RolandGarrosPredictor:
             "round_number": round_number,
             "tourney_date": match_date,
         }
-        self._apply_result(result, retrain=True)
+        self._apply_result(result, retrain=False)
         self._save_rg2026_result(result)
 
         print(f"  Résultat enregistré : {winner} bat {loser} ({score}) — Tour {round_number}")
         return {"status": "ok", "winner": winner, "loser": loser}
+
+    def retrain(self) -> None:
+        """Réentraîne le mini-modèle RG manuellement après saisie des résultats."""
+        self._retrain()
 
     def predict_tournament(self, draw: dict) -> pd.DataFrame:
         """
@@ -495,6 +515,19 @@ class RolandGarrosPredictor:
         row = recent.iloc[0]
         age = row["winner_age"] if row["winner_name"] == player else row["loser_age"]
         return float(age) if pd.notna(age) else 25.0
+
+    def delete_result(self, index: int) -> bool:
+        """Supprime le résultat à l'index donné et réécrit le fichier."""
+        if index < 0 or index >= len(self._rg2026_results):
+            return False
+        self._rg2026_results.pop(index)
+        self._rewrite_results_file()
+        return True
+
+    def _rewrite_results_file(self) -> None:
+        with open(self.rg2026_path, "w") as f:
+            for r in self._rg2026_results:
+                f.write(json.dumps(r) + "\n")
 
     def _save_rg2026_result(self, result: dict) -> None:
         with open(self.rg2026_path, "a") as f:

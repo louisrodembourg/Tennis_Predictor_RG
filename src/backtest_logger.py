@@ -1,11 +1,12 @@
 """
 Persistance des résultats de backtesting.
-Chaque run est ajouté au fichier results/backtest_history.txt avec une
-ligne de titre décrivant la configuration (date, features, hyperparamètres).
+Chaque run est ajouté au fichier results/backtest_history.txt (texte lisible)
+ET dans results/runs/run_TIMESTAMP.json (structuré pour comparaison).
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -14,9 +15,87 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_OUTPUT = Path(__file__).parent.parent / "results" / "backtest_history.txt"
+RUNS_DIR = Path(__file__).parent.parent / "results" / "runs"
 
 SEP  = "=" * 80
 SEP2 = "-" * 80
+
+
+def _results_to_dict(results: list, baseline_df: Optional[pd.DataFrame], config: dict) -> dict:
+    """Sérialise les résultats en dict JSON-compatible."""
+    ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    per_year = []
+    for r in results:
+        per_year.append({
+            "year": r.year,
+            "acc_base":    round(r.accuracy, 4),
+            "brier_base":  round(r.brier, 4),
+            "ll_base":     round(getattr(r, "log_loss_val", float("nan")), 4),
+            "acc_blend":   round(getattr(r, "accuracy_blend", float("nan")), 4),
+            "brier_blend": round(getattr(r, "brier_blend", float("nan")), 4),
+            "ll_blend":    round(getattr(r, "log_loss_blend", float("nan")), 4),
+            "n_matches":   r.n_matches,
+        })
+
+    baselines: list[dict] = []
+    if baseline_df is not None and not baseline_df.empty:
+        for _, row in baseline_df.iterrows():
+            baselines.append({k: (round(v, 4) if isinstance(v, float) else v)
+                              for k, v in row.items()})
+
+    accs   = [r["acc_base"]   for r in per_year if not np.isnan(r["acc_base"])]
+    briers = [r["brier_base"] for r in per_year if not np.isnan(r["brier_base"])]
+    accs_bl   = [r["acc_blend"]   for r in per_year if not np.isnan(r["acc_blend"])]
+    briers_bl = [r["brier_blend"] for r in per_year if not np.isnan(r["brier_blend"])]
+
+    return {
+        "timestamp": ts,
+        "config": {k: (v if not isinstance(v, list) else f"[{len(v)} features]")
+                   for k, v in config.items()},
+        "n_features": config.get("n_features", None),
+        "summary": {
+            "avg_acc_base":    round(np.mean(accs),    4) if accs    else None,
+            "avg_brier_base":  round(np.mean(briers),  4) if briers  else None,
+            "avg_acc_blend":   round(np.mean(accs_bl), 4) if accs_bl else None,
+            "avg_brier_blend": round(np.mean(briers_bl), 4) if briers_bl else None,
+        },
+        "per_year": per_year,
+        "baselines": baselines,
+    }
+
+
+def save_run_json(
+    results: list,
+    baseline_df: Optional[pd.DataFrame],
+    config: dict,
+    label: str = "",
+) -> Path:
+    """Sauvegarde un fichier JSON structuré pour ce run dans results/runs/."""
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = f"_{label.replace(' ', '_')}" if label else ""
+    path = RUNS_DIR / f"run_{ts}{slug}.json"
+    data = _results_to_dict(results, baseline_df, config)
+    data["label"] = label or ts
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def load_all_runs() -> list[dict]:
+    """Charge tous les fichiers JSON de runs, triés par timestamp."""
+    if not RUNS_DIR.exists():
+        return []
+    runs = []
+    for p in sorted(RUNS_DIR.glob("run_*.json")):
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            data["_file"] = p.name
+            runs.append(data)
+        except Exception:
+            continue
+    return sorted(runs, key=lambda d: d.get("timestamp", ""))
 
 
 def save_backtest_results(
@@ -24,13 +103,17 @@ def save_backtest_results(
     baseline_df: Optional[pd.DataFrame],
     config: dict,
     output_path: Optional[Path | str] = None,
+    label: str = "",
 ) -> Path:
-    """Ajoute (append) un bloc complet de résultats dans le fichier historique."""
+    """Ajoute un bloc de résultats dans le fichier texte ET sauvegarde un JSON structuré."""
     path = Path(output_path) if output_path else DEFAULT_OUTPUT
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # JSON structuré pour comparaison
+    save_run_json(results, baseline_df, config, label=label)
+
     with open(path, "a", encoding="utf-8") as f:
-        _write_header(f, config)
+        _write_header(f, config, label=label)
         _write_results_by_year(f, results)
         _write_results_by_round(f, results)
         if baseline_df is not None and not baseline_df.empty:
@@ -44,9 +127,11 @@ def save_backtest_results(
 # Sections
 # ---------------------------------------------------------------------------
 
-def _write_header(f, config: dict) -> None:
+def _write_header(f, config: dict, label: str = "") -> None:
     f.write(f"\n{SEP}\n")
-    f.write(f"  RUN  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    label_part = f"  [{label}]" if label else ""
+    f.write(f"  RUN  {ts}{label_part}\n")
     f.write(f"{SEP}\n")
     for key, val in config.items():
         if isinstance(val, list):

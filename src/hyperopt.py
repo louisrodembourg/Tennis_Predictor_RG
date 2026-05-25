@@ -21,7 +21,8 @@ from features import FEATURE_COLS, build_symmetric_dataset
 from model import MAIN_DRAW_ROUNDS
 
 
-BEST_PARAMS_PATH = Path(__file__).parent / "best_params.json"
+BEST_PARAMS_PATH       = Path(__file__).parent / "best_params.json"
+BEST_BLEND_PARAMS_PATH = Path(__file__).parent / "best_blend_params.json"
 
 # Années utilisées pour l'optimisation ; 2023-2025 restent holdout
 CV_YEARS = list(range(2017, 2023))
@@ -148,6 +149,178 @@ def load_best_params() -> Optional[dict]:
 def get_xgb_params(best: dict) -> dict:
     """Extrait les paramètres XGBoost purs depuis le dict Optuna (enlève les méta-clés)."""
     skip = {"calibration_method", "calibration_cv", "_best_brier", "_n_trials"}
+    return {k: v for k, v in best.items() if k not in skip}
+
+
+# ---------------------------------------------------------------------------
+# Blend Optuna (Étape 2) — optimise les paramètres de blend
+# ---------------------------------------------------------------------------
+
+def _pretrain_base_models(
+    all_feat: pd.DataFrame,
+    rg_feat: pd.DataFrame,
+    xgb_params: dict,
+    calibration_method: str,
+    calibration_cv: int,
+    temporal_lambda: float,
+    feature_cols: list[str],
+    years: list[int],
+) -> dict:
+    """Pré-entraîne un modèle de base par année (exécuté une seule fois avant l'étude blend)."""
+    from model import train_model, MAIN_DRAW_ROUNDS as MDR
+    import tqdm as _tqdm
+    models = {}
+    for year in _tqdm.tqdm(years, desc="Pré-entraînement modèles de base", ncols=80):
+        rg_year = rg_feat[
+            (rg_feat["tourney_date"].dt.year == year) & (rg_feat["round_number"].isin(MDR))
+        ]
+        if rg_year.empty:
+            continue
+        rg_start = rg_year["tourney_date"].min()
+        train_df = all_feat[all_feat["tourney_date"] < rg_start]
+        if len(train_df) < 100:
+            continue
+        models[year] = train_model(
+            train_df, feature_cols, calibrate=True,
+            xgb_params=xgb_params,
+            calibration_method=calibration_method,
+            calibration_cv=calibration_cv,
+            temporal_lambda=temporal_lambda,
+        )
+    return models
+
+
+def _score_blend_params(
+    blend_params: dict,
+    rg_feat: pd.DataFrame,
+    base_models: dict,
+    feature_cols: list[str],
+    years: list[int],
+) -> float:
+    """Score de Brier moyen sur les prédictions blendées (modèles de base pré-cachés)."""
+    from model import train_mini_model, blend_probas, dynamic_alpha, MAIN_DRAW_ROUNDS as MDR
+
+    ba      = blend_params["blend_alpha"]
+    bat     = blend_params["blend_alpha_target"]
+    d_lo    = int(blend_params["decay_lo"])
+    d_hi    = int(blend_params["decay_hi"])
+    afl     = blend_params["alpha_floor_late_round"]
+    min_rg  = int(blend_params["min_rg_for_blend"])
+
+    total_brier = 0.0
+    total_n = 0
+
+    for year in years:
+        if year not in base_models:
+            continue
+        base_model = base_models[year]
+        rg_year = rg_feat[
+            (rg_feat["tourney_date"].dt.year == year) & (rg_feat["round_number"].isin(MDR))
+        ].copy()
+        if rg_year.empty:
+            continue
+
+        rounds = sorted(rg_year["round_number"].unique())
+        rg_seen: list = []
+
+        for rn in rounds:
+            rn_df = rg_year[rg_year["round_number"] == rn]
+            X_rn = rn_df[feature_cols].fillna(0)
+            y_rn = rn_df["target"].values
+
+            rg_so_far = pd.concat(rg_seen, ignore_index=True) if rg_seen else pd.DataFrame()
+            n_rg = len(rg_so_far)
+            alpha = dynamic_alpha(
+                n_rg * 2, round_number=rn,
+                blend_alpha=ba, blend_alpha_target=bat,
+                decay_lo=d_lo, decay_hi=d_hi,
+                alpha_floor_late_round=afl,
+            )
+            mini = train_mini_model(rg_so_far, feature_cols, min_rg=min_rg) if not rg_so_far.empty else None
+            blend_p = blend_probas(base_model, mini, X_rn, feature_cols, alpha=alpha)
+
+            total_brier += brier_score_loss(y_rn, blend_p) * len(y_rn)
+            total_n += len(y_rn)
+            rg_seen.append(rn_df)
+
+    return total_brier / total_n if total_n > 0 else np.inf
+
+
+def run_blend_optuna(
+    all_feat: pd.DataFrame,
+    rg_feat: pd.DataFrame,
+    xgb_params: dict | None = None,
+    calibration_method: str = "isotonic",
+    calibration_cv: int = 4,
+    temporal_lambda: float = 0.0,
+    n_trials: int = 50,
+    feature_cols: list[str] = FEATURE_COLS,
+    on_trial_end: Optional[Callable[[int, float, dict], None]] = None,
+) -> optuna.Study:
+    """
+    Optimise les paramètres de blend (alpha, decay, min_rg) avec Optuna.
+    Les modèles XGBoost de base sont pré-entraînés une seule fois avant l'étude.
+    """
+    from model import XGB_PARAMS
+
+    if xgb_params is None:
+        xgb_params = XGB_PARAMS
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    print(f"Pré-entraînement des {len(CV_YEARS)} modèles de base (fait une seule fois)...")
+    base_models = _pretrain_base_models(
+        all_feat, rg_feat, xgb_params, calibration_method, calibration_cv,
+        temporal_lambda, feature_cols, CV_YEARS,
+    )
+    print(f"  {len(base_models)} modèles prêts. Lancement de l'étude blend...")
+
+    study = optuna.create_study(
+        study_name="blend_params",
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+    )
+
+    def objective(trial: optuna.Trial) -> float:
+        blend_alpha = trial.suggest_float("blend_alpha", 0.50, 0.90)
+        blend_alpha_target = trial.suggest_float("blend_alpha_target", 0.30, blend_alpha - 0.05)
+        params = {
+            "blend_alpha":             blend_alpha,
+            "blend_alpha_target":      blend_alpha_target,
+            "alpha_floor_late_round":  trial.suggest_float("alpha_floor_late_round", 0.60, 0.95),
+            "decay_lo":                trial.suggest_int("decay_lo", 5, 40),
+            "decay_hi":                trial.suggest_int("decay_hi", 50, 300),
+            "min_rg_for_blend":        trial.suggest_int("min_rg_for_blend", 5, 40),
+        }
+        return _score_blend_params(params, rg_feat, base_models, feature_cols, CV_YEARS)
+
+    def _cb(study: optuna.Study, trial: optuna.Trial) -> None:
+        if on_trial_end is not None:
+            on_trial_end(trial.number + 1, study.best_value, study.best_params)
+
+    study.optimize(objective, n_trials=n_trials, callbacks=[_cb])
+    return study
+
+
+def save_best_blend_params(study: optuna.Study) -> dict:
+    """Sauvegarde les meilleurs paramètres blend dans best_blend_params.json."""
+    best = study.best_params.copy()
+    best["_best_brier"] = study.best_value
+    best["_n_trials"] = len(study.trials)
+    BEST_BLEND_PARAMS_PATH.write_text(json.dumps(best, indent=2))
+    return best
+
+
+def load_best_blend_params() -> Optional[dict]:
+    """Charge les meilleurs paramètres blend, None si absent."""
+    if not BEST_BLEND_PARAMS_PATH.exists():
+        return None
+    return json.loads(BEST_BLEND_PARAMS_PATH.read_text())
+
+
+def get_blend_params(best: dict) -> dict:
+    """Extrait les paramètres blend purs (enlève les méta-clés)."""
+    skip = {"_best_brier", "_n_trials"}
     return {k: v for k, v in best.items() if k not in skip}
 
 

@@ -110,8 +110,18 @@ def run_full_backtest(data_dir: str, year_start: int = 2000) -> dict:
 
     # [6] Expanding window backtest
     t = _step(6, "Expanding window backtesting (RG 2017-2025)")
-    results = expanding_window_backtest(all_feat, rg_feat, rg_raw_df=rg_with_elo)
+    results, preds_df = expanding_window_backtest(
+        all_feat, rg_feat, rg_raw_df=rg_with_elo,
+        return_preds=True, return_cal_preds=True,
+    )
     _done(t, f"{len(results)} éditions évaluées")
+
+    # Sauvegarde des prédictions de calibration conformal (2017-2021)
+    if not preds_df.empty:
+        cal_path = Path(__file__).parent.parent / "data" / "cache" / "conformal_cal.parquet"
+        cal_path.parent.mkdir(parents=True, exist_ok=True)
+        preds_df.to_parquet(cal_path, index=False)
+        tqdm.write(f"       Prédictions conformal sauvegardées ({len(preds_df)} matchs)")
 
     # [7] Comparaison baselines
     t = _step(7, "Comparaison avec les baselines (Ranking / Clay Elo / WElo / XGBoost)")
@@ -127,6 +137,7 @@ def run_full_backtest(data_dir: str, year_start: int = 2000) -> dict:
         "baseline_comparison": baseline_df,
         "all_features": all_feat,
         "rg_features": rg_feat,
+        "predictions_df": preds_df,
     }
 
 

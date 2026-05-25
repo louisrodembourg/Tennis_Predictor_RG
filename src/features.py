@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+FEATURE_VERSION = "v2"  # increment to invalidate stale feature cache
 BEST_ROUND_ENCODING = {"R128": 1, "R64": 2, "R32": 3, "R16": 4, "QF": 5, "SF": 6, "F": 7}
 _EMPTY = pd.DataFrame()
 
@@ -158,8 +159,8 @@ class HistoryIndex:
 
     def _build_player_state(self, history: pd.DataFrame) -> pd.DataFrame:
         # --- Format long (gagnant + perdant) ---
-        w_cols = ["tourney_date", "surface", "score", "minutes", "winner_name", "loser_name"] + [f"w_{c}" for c in _SRV_NORM]
-        l_cols = ["tourney_date", "surface", "score", "minutes", "loser_name", "winner_name"] + [f"l_{c}" for c in _SRV_NORM]
+        w_cols = ["tourney_date", "surface", "score", "minutes", "winner_name", "loser_name", "tourney_id", "best_of"] + [f"w_{c}" for c in _SRV_NORM]
+        l_cols = ["tourney_date", "surface", "score", "minutes", "loser_name", "winner_name", "tourney_id", "best_of"] + [f"l_{c}" for c in _SRV_NORM]
 
         w = history[[c for c in w_cols if c in history.columns]].copy()
         l = history[[c for c in l_cols if c in history.columns]].copy()
@@ -197,6 +198,13 @@ class HistoryIndex:
         DAY = np.timedelta64(1, "D")
         N = len(df)
 
+        best_of_col = (
+            pd.to_numeric(df["best_of"], errors="coerce").fillna(3.0).values
+            if "best_of" in df.columns else np.full(N, 3.0)
+        )
+        has_tourney_id = "tourney_id" in df.columns
+        tourney_id_col = df["tourney_id"].values if has_tourney_id else None
+
         out_matches_21d    = np.zeros(N)
         out_sets_21d       = np.zeros(N)
         out_minutes_21d    = np.zeros(N)
@@ -207,8 +215,15 @@ class HistoryIndex:
         out_fsp            = np.full(N, 0.6)
         out_fswp           = np.full(N, 0.7)
         out_bpsp           = np.full(N, 0.6)
-        out_matches_before = np.zeros(N)
-        out_wins_before    = np.zeros(N)
+        out_matches_before       = np.zeros(N)
+        out_wins_before          = np.zeros(N)
+        out_wr_clay_90d          = np.full(N, 0.5)
+        out_win_streak_clay      = np.zeros(N)
+        out_pct_3plus_sets_12m   = np.full(N, 0.5)
+        out_pct_5sets_12m        = np.full(N, 0.4)
+        out_avg_duration_12m     = np.full(N, 90.0)
+        out_days_since_non_clay  = np.zeros(N)
+        out_clay_streak_tourns   = np.zeros(N)
 
         # df est déjà trié par (player, tourney_date)
         player_col = df["player"].values
@@ -264,6 +279,63 @@ class HistoryIndex:
             out_matches_before[s:e] = idx.astype(float)
             out_wins_before[s:e]    = cs_w[idx]
 
+            # win_rate_clay_90d
+            cw90 = _ws(cs_cw, 90); cm90 = _ws(cs_cm, 90)
+            np.divide(cw90, cm90, out=out_wr_clay_90d[s:e], where=(cm90 > 0))
+
+            # win_streak_clay : consecutive clay wins before current match
+            not_cw = (clay_w == 0)
+            reset_cum = np.where(not_cw, np.arange(n), -1)
+            last_reset_incl = np.maximum.accumulate(reset_cum)
+            last_reset_excl = np.concatenate([[-1], last_reset_incl[:-1]])
+            out_win_streak_clay[s:e] = np.maximum(0, np.arange(n) - last_reset_excl - 1)
+
+            # pct_3plus_sets_12m
+            cs_3p = np.empty(n + 1); cs_3p[0] = 0.0
+            np.cumsum((sets_arr >= 3).astype(float), out=cs_3p[1:])
+            s3p12 = _ws(cs_3p, 365)
+            m12   = _ws(np.arange(n + 1, dtype=float), 365)
+            np.divide(s3p12, m12, out=out_pct_3plus_sets_12m[s:e], where=(m12 > 0))
+
+            # pct_5sets_12m (best_of==5 matches only)
+            bo_arr = best_of_col[s:e]
+            is_bo5 = (bo_arr == 5).astype(float)
+            is_5s  = ((sets_arr >= 5) & (bo_arr == 5)).astype(float)
+            cs_bo5 = np.empty(n + 1); cs_bo5[0] = 0.0; np.cumsum(is_bo5, out=cs_bo5[1:])
+            cs_5s  = np.empty(n + 1); cs_5s[0]  = 0.0; np.cumsum(is_5s,  out=cs_5s[1:])
+            bo5_12m = _ws(cs_bo5, 365); s5_12m = _ws(cs_5s, 365)
+            np.divide(s5_12m, bo5_12m, out=out_pct_5sets_12m[s:e], where=(bo5_12m > 0))
+
+            # avg_match_duration_12m (exclude matches where minutes==0)
+            valid_min = (mins_arr > 0).astype(float)
+            cs_vmin = np.empty(n + 1); cs_vmin[0] = 0.0; np.cumsum(valid_min, out=cs_vmin[1:])
+            mn12    = _ws(cs_mn, 365); cnt_mn12 = _ws(cs_vmin, 365)
+            np.divide(mn12, cnt_mn12, out=out_avg_duration_12m[s:e], where=(cnt_mn12 > 0))
+
+            # days_since_non_clay
+            not_clay_mask = (clay_m == 0)
+            nc_reset = np.where(not_clay_mask, np.arange(n), -1)
+            last_nc_incl = np.maximum.accumulate(nc_reset)
+            last_nc_excl = np.concatenate([[-1], last_nc_incl[:-1]])
+            has_nc = last_nc_excl >= 0
+            safe_nc_idx = np.maximum(0, last_nc_excl).astype(int)
+            out_days_since_non_clay[s:e] = np.where(
+                has_nc, (dates - dates[safe_nc_idx]) / DAY, 0.0
+            )
+
+            # clay_streak_tournaments : consecutive clay tournaments before current
+            if has_tourney_id:
+                tid_arr = tourney_id_col[s:e]
+                tid_change = np.concatenate([[True], tid_arr[1:] != tid_arr[:-1]])
+                tourney_starts = np.where(tid_change)[0]
+                n_t = len(tourney_starts)
+                tourney_is_clay = clay_m[tourney_starts].astype(bool)
+                clay_streak_t = np.zeros(n_t, dtype=np.int64)
+                for t in range(1, n_t):
+                    clay_streak_t[t] = clay_streak_t[t - 1] + 1 if tourney_is_clay[t - 1] else 0
+                match_t_idx = np.searchsorted(tourney_starts, np.arange(n), side="right") - 1
+                out_clay_streak_tourns[s:e] = clay_streak_t[match_t_idx]
+
             # win_rate_last10 via rolling numpy cumsum
             cs_w_full = np.concatenate([[0.0], np.cumsum(won_arr)])
             end10 = idx
@@ -288,20 +360,27 @@ class HistoryIndex:
                 np.divide(bs20, bf20, out=out_bpsp[s:e], where=(bf20 > 0))
 
         result = pd.DataFrame({
-            "player":              player_col,
-            "tourney_date":        df["tourney_date"].values,
-            "matches_21d":         out_matches_21d,
-            "sets_21d":            out_sets_21d,
-            "minutes_21d":         out_minutes_21d,
-            "win_rate_clay_12m":   out_wr_clay_12m,
-            "win_rate_clay_6m":    out_wr_clay_6m,
-            "win_rate_30d":        out_wr_30d,
-            "win_rate_last10":     out_wr_last10,
-            "first_serve_pct":     out_fsp,
-            "first_serve_won_pct": out_fswp,
-            "bp_saved_pct":        out_bpsp,
-            "matches_before":      out_matches_before,
-            "wins_before":         out_wins_before,
+            "player":                  player_col,
+            "tourney_date":            df["tourney_date"].values,
+            "matches_21d":             out_matches_21d,
+            "sets_21d":                out_sets_21d,
+            "minutes_21d":             out_minutes_21d,
+            "win_rate_clay_12m":       out_wr_clay_12m,
+            "win_rate_clay_6m":        out_wr_clay_6m,
+            "win_rate_30d":            out_wr_30d,
+            "win_rate_last10":         out_wr_last10,
+            "first_serve_pct":         out_fsp,
+            "first_serve_won_pct":     out_fswp,
+            "bp_saved_pct":            out_bpsp,
+            "matches_before":          out_matches_before,
+            "wins_before":             out_wins_before,
+            "win_rate_clay_90d":       out_wr_clay_90d,
+            "win_streak_clay":         out_win_streak_clay,
+            "pct_3plus_sets_12m":      out_pct_3plus_sets_12m,
+            "pct_5sets_12m":           out_pct_5sets_12m,
+            "avg_match_duration_12m":  out_avg_duration_12m,
+            "days_since_non_clay":     out_days_since_non_clay,
+            "clay_streak_tournaments": out_clay_streak_tourns,
         })
         return result.sort_values(["player", "tourney_date"]).reset_index(drop=True)
 
@@ -332,7 +411,35 @@ class HistoryIndex:
         )
         long["rg_win_rate"] = (long["rg_wins"] / long["rg_matches"]).replace([np.inf, -np.inf], np.nan).fillna(0.5)
 
-        return long[["player", "tourney_date", "rg_win_rate", "rg_matches", "best_round_rg"]].copy()
+        # 3-year windowed RG stats
+        N_rg = len(long)
+        out_wr_rg_3yr   = np.full(N_rg, 0.5)
+        out_br_rg_3yr   = np.ones(N_rg)
+        _DAY = np.timedelta64(1, "D")
+        _p_col   = long["player"].values
+        _d_col   = long["tourney_date"].values.astype("datetime64[D]")
+        _won_col = long["won_i"].values.astype(float)
+        _rnd_col = long["round_num"].values.astype(float)
+        _bounds  = np.where(np.concatenate([[True], _p_col[1:] != _p_col[:-1], [True]]))[0]
+        for _k in range(len(_bounds) - 1):
+            _s, _e = int(_bounds[_k]), int(_bounds[_k + 1])
+            _n = _e - _s
+            _dates = _d_col[_s:_e]
+            _won   = _won_col[_s:_e]
+            _rnds  = _rnd_col[_s:_e]
+            _cs_w  = np.zeros(_n + 1); np.cumsum(_won, out=_cs_w[1:])
+            _st3   = np.searchsorted(_dates, _dates - np.timedelta64(1095, "D"), side="left")
+            for _i in range(_n):
+                _st = int(_st3[_i])
+                if _st < _i:
+                    _m = float(_i - _st)
+                    out_wr_rg_3yr[_s + _i] = (_cs_w[_i] - _cs_w[_st]) / _m
+                    out_br_rg_3yr[_s + _i] = float(np.max(_rnds[_st:_i]))
+        long["win_rate_rg_3yr"]  = out_wr_rg_3yr
+        long["best_round_rg_3yr"] = out_br_rg_3yr
+
+        return long[["player", "tourney_date", "rg_win_rate", "rg_matches", "best_round_rg",
+                     "win_rate_rg_3yr", "best_round_rg_3yr"]].copy()
 
     def _build_h2h_state(self, history: pd.DataFrame) -> pd.DataFrame:
         cols = ["tourney_date", "surface", "winner_name", "loser_name"]
@@ -568,6 +675,9 @@ def build_features(
         "win_rate_clay_12m", "win_rate_clay_6m", "win_rate_30d", "win_rate_last10",
         "first_serve_pct", "first_serve_won_pct", "bp_saved_pct",
         "matches_before", "wins_before",
+        "win_rate_clay_90d", "win_streak_clay",
+        "pct_3plus_sets_12m", "pct_5sets_12m", "avg_match_duration_12m",
+        "days_since_non_clay", "clay_streak_tournaments",
     ]
     if not index.player_state.empty:
         state_a = index.player_state.rename(columns={"player": "player_a", **{c: f"{c}_a" for c in player_state_cols}})
@@ -581,10 +691,22 @@ def build_features(
 
     # RG historique A/B
     if not index.rg_state.empty:
-        rg_a = index.rg_state.rename(columns={"player": "player_a", "rg_win_rate": "rg_win_rate_a", "rg_matches": "rg_matches_a", "best_round_rg": "best_round_rg_a"})
-        rg_b = index.rg_state.rename(columns={"player": "player_b", "rg_win_rate": "rg_win_rate_b", "rg_matches": "rg_matches_b", "best_round_rg": "best_round_rg_b"})
-        base = _merge_asof_by_keys(base, rg_a[["player_a", "tourney_date", "rg_win_rate_a", "rg_matches_a", "best_round_rg_a"]], by=["player_a"])
-        base = _merge_asof_by_keys(base, rg_b[["player_b", "tourney_date", "rg_win_rate_b", "rg_matches_b", "best_round_rg_b"]], by=["player_b"])
+        rg_a = index.rg_state.rename(columns={
+            "player": "player_a", "rg_win_rate": "rg_win_rate_a", "rg_matches": "rg_matches_a",
+            "best_round_rg": "best_round_rg_a", "win_rate_rg_3yr": "win_rate_rg_3yr_a",
+            "best_round_rg_3yr": "best_round_rg_3yr_a",
+        })
+        rg_b = index.rg_state.rename(columns={
+            "player": "player_b", "rg_win_rate": "rg_win_rate_b", "rg_matches": "rg_matches_b",
+            "best_round_rg": "best_round_rg_b", "win_rate_rg_3yr": "win_rate_rg_3yr_b",
+            "best_round_rg_3yr": "best_round_rg_3yr_b",
+        })
+        rg_a_cols = ["player_a", "tourney_date", "rg_win_rate_a", "rg_matches_a", "best_round_rg_a",
+                     "win_rate_rg_3yr_a", "best_round_rg_3yr_a"]
+        rg_b_cols = ["player_b", "tourney_date", "rg_win_rate_b", "rg_matches_b", "best_round_rg_b",
+                     "win_rate_rg_3yr_b", "best_round_rg_3yr_b"]
+        base = _merge_asof_by_keys(base, rg_a[[c for c in rg_a_cols if c in rg_a.columns]], by=["player_a"])
+        base = _merge_asof_by_keys(base, rg_b[[c for c in rg_b_cols if c in rg_b.columns]], by=["player_b"])
     else:
         base["rg_win_rate_a"] = 0.5
         base["rg_win_rate_b"] = 0.5
@@ -592,6 +714,10 @@ def build_features(
         base["rg_matches_b"] = 0
         base["best_round_rg_a"] = 1
         base["best_round_rg_b"] = 1
+        base["win_rate_rg_3yr_a"] = 0.5
+        base["win_rate_rg_3yr_b"] = 0.5
+        base["best_round_rg_3yr_a"] = 1
+        base["best_round_rg_3yr_b"] = 1
 
     # H2H clay A/B
     if not index.h2h_state.empty:
@@ -607,11 +733,19 @@ def build_features(
         "matches_21d_a": 0, "sets_21d_a": 0, "minutes_21d_a": 0,
         "win_rate_clay_12m_a": 0.5, "win_rate_clay_6m_a": 0.5, "win_rate_30d_a": 0.5, "win_rate_last10_a": 0.5,
         "first_serve_pct_a": 0.6, "first_serve_won_pct_a": 0.7, "bp_saved_pct_a": 0.6, "matches_before_a": 0, "wins_before_a": 0,
+        "win_rate_clay_90d_a": 0.5, "win_streak_clay_a": 0,
+        "pct_3plus_sets_12m_a": 0.5, "pct_5sets_12m_a": 0.4, "avg_match_duration_12m_a": 90.0,
+        "days_since_non_clay_a": 0, "clay_streak_tournaments_a": 0,
         "matches_21d_b": 0, "sets_21d_b": 0, "minutes_21d_b": 0,
         "win_rate_clay_12m_b": 0.5, "win_rate_clay_6m_b": 0.5, "win_rate_30d_b": 0.5, "win_rate_last10_b": 0.5,
         "first_serve_pct_b": 0.6, "first_serve_won_pct_b": 0.7, "bp_saved_pct_b": 0.6, "matches_before_b": 0, "wins_before_b": 0,
+        "win_rate_clay_90d_b": 0.5, "win_streak_clay_b": 0,
+        "pct_3plus_sets_12m_b": 0.5, "pct_5sets_12m_b": 0.4, "avg_match_duration_12m_b": 90.0,
+        "days_since_non_clay_b": 0, "clay_streak_tournaments_b": 0,
         "rg_win_rate_a": 0.5, "rg_matches_a": 0, "best_round_rg_a": 1,
         "rg_win_rate_b": 0.5, "rg_matches_b": 0, "best_round_rg_b": 1,
+        "win_rate_rg_3yr_a": 0.5, "best_round_rg_3yr_a": 1,
+        "win_rate_rg_3yr_b": 0.5, "best_round_rg_3yr_b": 1,
         "h2h_clay_wins_a": 0, "h2h_clay_total": 0, "h2h_clay_rate": 0.5,
     }
     for c, default in fill_defaults.items():
@@ -619,18 +753,38 @@ def build_features(
             base[c] = base[c].fillna(default)
 
     # Diff features
-    base["diff_win_rate_clay_12m"] = base["win_rate_clay_12m_a"] - base["win_rate_clay_12m_b"]
-    base["diff_win_rate_clay_6m"] = base["win_rate_clay_6m_a"] - base["win_rate_clay_6m_b"]
-    base["diff_win_rate_30d"] = base["win_rate_30d_a"] - base["win_rate_30d_b"]
-    base["diff_matches_21d"] = base["matches_21d_a"] - base["matches_21d_b"]
-    base["diff_sets_21d"] = base["sets_21d_a"] - base["sets_21d_b"]
-    base["diff_minutes_21d"] = base["minutes_21d_a"] - base["minutes_21d_b"]
-    base["diff_win_rate_last10"] = base["win_rate_last10_a"] - base["win_rate_last10_b"]
-    base["diff_rg_win_rate"] = base["rg_win_rate_a"] - base["rg_win_rate_b"]
-    base["diff_best_round_rg"] = base["best_round_rg_a"] - base["best_round_rg_b"]
-    base["diff_first_serve_pct"] = base["first_serve_pct_a"] - base["first_serve_pct_b"]
-    base["diff_first_serve_won_pct"] = base["first_serve_won_pct_a"] - base["first_serve_won_pct_b"]
-    base["diff_bp_saved_pct"] = base["bp_saved_pct_a"] - base["bp_saved_pct_b"]
+    age_clay_a = base["age_a"] * base["elo_a_clay"]
+    age_clay_b = base["age_b"] * base["elo_b_clay"]
+
+    extra = {
+        "diff_win_rate_clay_12m":       base["win_rate_clay_12m_a"]                    - base["win_rate_clay_12m_b"],
+        "diff_win_rate_clay_6m":        base["win_rate_clay_6m_a"]                     - base["win_rate_clay_6m_b"],
+        "diff_win_rate_30d":            base["win_rate_30d_a"]                         - base["win_rate_30d_b"],
+        "diff_matches_21d":             base["matches_21d_a"]                          - base["matches_21d_b"],
+        "diff_sets_21d":                base["sets_21d_a"]                             - base["sets_21d_b"],
+        "diff_minutes_21d":             base["minutes_21d_a"]                          - base["minutes_21d_b"],
+        "diff_win_rate_last10":         base["win_rate_last10_a"]                      - base["win_rate_last10_b"],
+        "diff_rg_win_rate":             base["rg_win_rate_a"]                          - base["rg_win_rate_b"],
+        "diff_best_round_rg":           base["best_round_rg_a"]                        - base["best_round_rg_b"],
+        "diff_first_serve_pct":         base["first_serve_pct_a"]                      - base["first_serve_pct_b"],
+        "diff_first_serve_won_pct":     base["first_serve_won_pct_a"]                  - base["first_serve_won_pct_b"],
+        "diff_bp_saved_pct":            base["bp_saved_pct_a"]                         - base["bp_saved_pct_b"],
+        # Phase-2
+        "diff_win_rate_clay_90d":       base.get("win_rate_clay_90d_a", 0.5)           - base.get("win_rate_clay_90d_b", 0.5),
+        "diff_win_streak_clay":         base.get("win_streak_clay_a", 0.0)             - base.get("win_streak_clay_b", 0.0),
+        "diff_pct_3plus_sets_12m":      base.get("pct_3plus_sets_12m_a", 0.5)         - base.get("pct_3plus_sets_12m_b", 0.5),
+        "diff_pct_5sets_12m":           base.get("pct_5sets_12m_a", 0.4)              - base.get("pct_5sets_12m_b", 0.4),
+        "diff_avg_match_duration_12m":  base.get("avg_match_duration_12m_a", 90.0)    - base.get("avg_match_duration_12m_b", 90.0),
+        "diff_days_since_non_clay":     base.get("days_since_non_clay_a", 0.0)        - base.get("days_since_non_clay_b", 0.0),
+        "diff_clay_streak_tournaments": base.get("clay_streak_tournaments_a", 0.0)    - base.get("clay_streak_tournaments_b", 0.0),
+        "diff_win_rate_rg_3yr":         base.get("win_rate_rg_3yr_a", 0.5)            - base.get("win_rate_rg_3yr_b", 0.5),
+        "diff_best_round_rg_3yr":       base.get("best_round_rg_3yr_a", 1.0)          - base.get("best_round_rg_3yr_b", 1.0),
+        # Age × clay-Elo interaction
+        "age_clay_elo_interaction_a":   age_clay_a,
+        "age_clay_elo_interaction_b":   age_clay_b,
+        "diff_age_clay_elo_interaction": age_clay_a - age_clay_b,
+    }
+    base = pd.concat([base, pd.DataFrame(extra, index=base.index)], axis=1).copy()
 
     output_cols = [
         "match_id", "tourney_date", "player_a", "player_b", "target",
@@ -648,6 +802,14 @@ def build_features(
         "diff_first_serve_pct", "diff_first_serve_won_pct", "diff_bp_saved_pct",
         "first_serve_pct_a", "first_serve_won_pct_a", "bp_saved_pct_a",
         "round_number", "diff_sets_played_rg",
+        # Phase-2 new features
+        "diff_win_rate_clay_90d", "diff_win_streak_clay",
+        "diff_pct_3plus_sets_12m", "diff_pct_5sets_12m", "diff_avg_match_duration_12m",
+        "diff_days_since_non_clay", "diff_clay_streak_tournaments",
+        "diff_win_rate_rg_3yr", "diff_best_round_rg_3yr",
+        "diff_age_clay_elo_interaction",
+        "win_rate_rg_3yr_a", "win_rate_rg_3yr_b", "best_round_rg_3yr_a", "best_round_rg_3yr_b",
+        "age_clay_elo_interaction_a", "age_clay_elo_interaction_b",
     ]
 
     for col in output_cols:
@@ -713,20 +875,28 @@ FEATURE_COLS = [
     # Form récente
     "diff_win_rate_clay_12m", "diff_win_rate_clay_6m", "diff_win_rate_30d",
     "diff_win_rate_last10",
+    # Momentum clay (Phase 2)
+    "diff_win_rate_clay_90d", "diff_win_streak_clay",
     # Fatigue / charge de matchs (features les plus importantes)
     "diff_matches_21d", "diff_sets_21d", "diff_minutes_21d",
     "matches_21d_a", "matches_21d_b", "sets_21d_a", "sets_21d_b",
     "minutes_21d_a", "minutes_21d_b",
     # H2H clay
     "h2h_clay_rate", "h2h_clay_total",
-    # Performance Roland Garros
+    # Performance Roland Garros (carrière + 3 ans glissant)
     "diff_rg_win_rate", "rg_matches_a", "rg_matches_b", "diff_best_round_rg",
+    "diff_win_rate_rg_3yr", "diff_best_round_rg_3yr",
     # Classement ATP
     "ranking_diff", "log_ranking_diff",
-    # Âge
+    # Âge + interaction non-linéaire (Phase 2)
     "age_a", "age_b",
+    "diff_age_clay_elo_interaction",
     # Service (signal faible mais non nul)
     "diff_first_serve_won_pct", "diff_bp_saved_pct",
+    # Endurance / style de jeu (Phase 2)
+    "diff_pct_3plus_sets_12m", "diff_pct_5sets_12m", "diff_avg_match_duration_12m",
+    # Transition de surface (Phase 2)
+    "diff_days_since_non_clay", "diff_clay_streak_tournaments",
     # Contexte tournoi
     "round_number", "diff_sets_played_rg",
 ]

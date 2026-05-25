@@ -34,9 +34,11 @@ CACHE_DIR = Path(__file__).parent.parent / "data" / "cache"
 # ---------------------------------------------------------------------------
 
 def _csv_hash(data_dir: str) -> str:
-    """Hash stable basé sur les mtime de tous les CSV ATP."""
+    """Hash stable basé sur les mtime de tous les CSV ATP + la version des features."""
+    from features import FEATURE_VERSION
     files = sorted(glob.glob(str(Path(data_dir) / "atp_matches_*.csv")))
     h = hashlib.md5()
+    h.update(FEATURE_VERSION.encode())
     for f in files:
         h.update(f.encode())
         h.update(str(Path(f).stat().st_mtime).encode())

@@ -17,21 +17,66 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
 from xgboost import XGBClassifier
 
 from features import FEATURE_COLS, build_features, build_symmetric_dataset
 
 
-BLEND_ALPHA = 0.70       # poids du modèle historique (0.70 = 70 % base, 30 % RG)
-MIN_RG_FOR_BLEND = 20    # nombre minimum d'exemples symétriques RG pour activer le blend
+class _PreFitCalibrator:
+    """Calibrate a pre-fitted classifier on a held-out calibration set.
+
+    Replaces cv='prefit' which was removed in sklearn 1.6.
+    """
+
+    def __init__(self, base_model, method: str = "isotonic"):
+        self.base_model = base_model
+        self.method = method
+        self._cal: IsotonicRegression | LogisticRegression | None = None
+        self.classes_ = np.array([0, 1])
+
+    def fit(self, X, y) -> "_PreFitCalibrator":
+        raw = self.base_model.predict_proba(X)[:, 1]
+        if self.method == "isotonic":
+            self._cal = IsotonicRegression(out_of_bounds="clip")
+            self._cal.fit(raw, y)
+        else:
+            self._cal = LogisticRegression(C=1e10, max_iter=1000)
+            self._cal.fit(raw.reshape(-1, 1), y)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        raw = self.base_model.predict_proba(X)[:, 1]
+        if self.method == "isotonic":
+            p = np.clip(self._cal.predict(raw), 0.0, 1.0)
+        else:
+            p = np.clip(self._cal.predict_proba(raw.reshape(-1, 1))[:, 1], 0.0, 1.0)
+        return np.column_stack([1.0 - p, p])
+
+    def predict(self, X) -> np.ndarray:
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
+BLEND_ALPHA = 0.70           # poids du modèle historique (0.70 = 70 % base, 30 % RG)
+MIN_RG_FOR_BLEND = 20        # nombre minimum d'exemples symétriques RG pour activer le blend
+BLEND_DECAY_LO = 20          # n_rg_matches où le decay commence
+BLEND_DECAY_HI = 200         # n_rg_matches où le decay se termine
+BLEND_ALPHA_TARGET = 0.55    # plancher alpha en fin de tournoi (hors SF/F)
+ALPHA_FLOOR_LATE_ROUND = 0.80  # plancher alpha pour SF et Finale (round >= 6)
+TEMPORAL_LAMBDA = 0.0        # pondération temporelle : exp(-lambda * années); 0 = désactivé
 
 XGB_PARAMS = {
-    "n_estimators": 300,
-    "max_depth": 4,
-    "learning_rate": 0.05,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
+    "n_estimators": 481,
+    "max_depth": 6,
+    "learning_rate": 0.13488920131075532,
+    "subsample": 0.7599888384711799,
+    "colsample_bytree": 0.7379574222491043,
+    "min_child_weight": 4,
+    "gamma": 0.17089420663452654,
+    "reg_alpha": 0.1927608191335158,
+    "reg_lambda": 0.5819143307194267,
     "eval_metric": "logloss",
     "random_state": 42,
     "n_jobs": -1,
@@ -91,30 +136,64 @@ def train_model(
     calibrate: bool = True,
     xgb_params: dict | None = None,
     calibration_method: str = "isotonic",
-    calibration_cv: int = 3,
+    calibration_cv: int = 4,
+    temporal_lambda: float = TEMPORAL_LAMBDA,
+    calibration_df: Optional[pd.DataFrame] = None,
 ) -> XGBClassifier | CalibratedClassifierCV:
-    """Entraîne le modèle de base (historique) sur feature_df symétrisé."""
+    """
+    Entraîne le modèle de base (historique) sur feature_df symétrisé.
+
+    Si calibration_df est fourni, le modèle XGB est d'abord entraîné sur feature_df
+    puis recalibré en mode 'prefit' sur calibration_df (clay avril-mai).
+    Sinon, calibration k-fold standard sur feature_df.
+    """
     sym_df = build_symmetric_dataset(feature_df)
     X = sym_df[feature_cols].fillna(0)
     y = sym_df["target"]
+
+    sample_weight = None
+    if temporal_lambda > 0.0 and "tourney_date" in sym_df.columns:
+        ref_date = pd.to_datetime(sym_df["tourney_date"]).max()
+        years_ago = (ref_date - pd.to_datetime(sym_df["tourney_date"])).dt.days / 365.25
+        sample_weight = np.exp(-temporal_lambda * years_ago.values)
+
     params = xgb_params if xgb_params is not None else XGB_PARAMS
-    model = XGBClassifier(**params)
-    if calibrate:
-        model = CalibratedClassifierCV(model, cv=calibration_cv, method=calibration_method)
-    model.fit(X, y)
+    fit_kwargs = {} if sample_weight is None else {"sample_weight": sample_weight}
+
+    if calibrate and calibration_df is not None and not calibration_df.empty:
+        # Phase 4.2: prefit calibration on April-May clay season data
+        raw_model = XGBClassifier(**params)
+        raw_model.fit(X, y, **fit_kwargs)
+        sym_cal = build_symmetric_dataset(calibration_df)
+        X_cal = sym_cal[feature_cols].fillna(0)
+        y_cal = sym_cal["target"]
+        if len(sym_cal) >= 20:
+            model = _PreFitCalibrator(raw_model, method=calibration_method)
+            model.fit(X_cal, y_cal)
+        else:
+            # Too few calibration samples — fall back to k-fold
+            model = CalibratedClassifierCV(XGBClassifier(**params), cv=calibration_cv, method=calibration_method)
+            model.fit(X, y, **fit_kwargs)
+    elif calibrate:
+        model = CalibratedClassifierCV(XGBClassifier(**params), cv=calibration_cv, method=calibration_method)
+        model.fit(X, y, **fit_kwargs)
+    else:
+        model = XGBClassifier(**params)
+        model.fit(X, y, **fit_kwargs)
     return model
 
 
 def train_mini_model(
     rg_feature_df: pd.DataFrame,
     feature_cols: list[str] = FEATURE_COLS,
+    min_rg: int = MIN_RG_FOR_BLEND,
 ) -> Optional[XGBClassifier]:
     """
     Entraîne un mini-modèle léger sur les matchs RG déjà joués.
     Retourne None si trop peu de données.
     """
     sym = build_symmetric_dataset(rg_feature_df)
-    if len(sym) < MIN_RG_FOR_BLEND:
+    if len(sym) < min_rg:
         return None
     X = sym[feature_cols].fillna(0)
     y = sym["target"]
@@ -147,22 +226,25 @@ def blend_probas(
     return alpha * base_p + (1.0 - alpha) * rg_p
 
 
-def dynamic_alpha(n_rg_matches: int, round_number: int = 1) -> float:
-    """
-    Alpha décroît de BLEND_ALPHA vers 0.55 selon le volume de données RG.
-    SF/F : plancher à 0.80 car trop peu d'exemples, le mini-modèle overfit.
-    """
-    lo, hi = 20, 200
-    if n_rg_matches <= lo:
-        base = BLEND_ALPHA
-    elif n_rg_matches >= hi:
-        base = 0.55
+def dynamic_alpha(
+    n_rg_matches: int,
+    round_number: int = 1,
+    blend_alpha: float = BLEND_ALPHA,
+    blend_alpha_target: float = BLEND_ALPHA_TARGET,
+    decay_lo: int = BLEND_DECAY_LO,
+    decay_hi: int = BLEND_DECAY_HI,
+    alpha_floor_late_round: float = ALPHA_FLOOR_LATE_ROUND,
+) -> float:
+    """Alpha décroît de blend_alpha vers blend_alpha_target selon le volume de données RG."""
+    if n_rg_matches <= decay_lo:
+        base = blend_alpha
+    elif n_rg_matches >= decay_hi:
+        base = blend_alpha_target
     else:
-        t = (n_rg_matches - lo) / (hi - lo)
-        base = BLEND_ALPHA - t * (BLEND_ALPHA - 0.55)
-    # SF et Finale : le mini-modèle a trop peu d'exemples → garder le modèle historique dominant
+        t = (n_rg_matches - decay_lo) / (decay_hi - decay_lo)
+        base = blend_alpha - t * (blend_alpha - blend_alpha_target)
     if round_number >= 6:
-        return max(0.80, base)
+        return max(alpha_floor_late_round, base)
     return base
 
 
@@ -209,8 +291,18 @@ def expanding_window_backtest(
     rg_raw_df: Optional[pd.DataFrame] = None,
     xgb_params: dict | None = None,
     calibration_method: str = "isotonic",
-    calibration_cv: int = 3,
-) -> list[BacktestResult]:
+    calibration_cv: int = 4,
+    temporal_lambda: float = TEMPORAL_LAMBDA,
+    blend_alpha_target: float = BLEND_ALPHA_TARGET,
+    decay_lo: int = BLEND_DECAY_LO,
+    decay_hi: int = BLEND_DECAY_HI,
+    alpha_floor_late_round: float = ALPHA_FLOOR_LATE_ROUND,
+    min_rg_for_blend: int = MIN_RG_FOR_BLEND,
+    return_preds: bool = False,
+    return_cal_preds: bool = False,
+    cal_years: list[int] | None = None,
+    use_clay_calibration: bool = False,
+) -> list[BacktestResult] | tuple[list[BacktestResult], pd.DataFrame]:
     """
     Pour chaque édition RG (2017-2025) :
       - Modèle de base  : toutes les features clay AVANT ce RG
@@ -220,8 +312,11 @@ def expanding_window_backtest(
     """
     if rg_years is None:
         rg_years = list(range(2017, 2026))
+    if cal_years is None:
+        cal_years = list(range(2017, 2022))
 
     results = []
+    all_preds_rows: list[dict] = []
     pbar = tqdm(rg_years, desc="Backtest RG", unit="édition", ncols=80)
 
     for year in pbar:
@@ -239,11 +334,25 @@ def expanding_window_backtest(
             continue
 
         pbar.set_description(f"Backtest RG {year} (train={len(train_df):,})")
+
+        # Phase 4.2: clay April-May calibration set (matches before RG, after April 1st)
+        calibration_df_year: Optional[pd.DataFrame] = None
+        if use_clay_calibration and "tourney_date" in all_feature_df.columns:
+            apr_start = pd.Timestamp(f"{year}-04-01")
+            cal_mask = (
+                (all_feature_df["tourney_date"] >= apr_start) &
+                (all_feature_df["tourney_date"] < rg_start)
+            )
+            if cal_mask.any():
+                calibration_df_year = all_feature_df[cal_mask].copy()
+
         base_model = train_model(
             train_df, feature_cols, calibrate=True,
             xgb_params=xgb_params,
             calibration_method=calibration_method,
             calibration_cv=calibration_cv,
+            temporal_lambda=temporal_lambda,
+            calibration_df=calibration_df_year,
         )
 
         # --- Simulation online round par round (tableau principal uniquement) ---
@@ -282,8 +391,13 @@ def expanding_window_backtest(
             # Mini-modèle sur les rounds précédents
             rg_so_far = pd.concat(rg_seen, ignore_index=True) if rg_seen else pd.DataFrame()
             n_rg = len(rg_so_far)
-            alpha = dynamic_alpha(n_rg * 2, round_number=rn)
-            mini = train_mini_model(rg_so_far, feature_cols) if not rg_so_far.empty else None
+            alpha = dynamic_alpha(
+                n_rg * 2, round_number=rn,
+                blend_alpha=blend_alpha, blend_alpha_target=blend_alpha_target,
+                decay_lo=decay_lo, decay_hi=decay_hi,
+                alpha_floor_late_round=alpha_floor_late_round,
+            )
+            mini = train_mini_model(rg_so_far, feature_cols, min_rg=min_rg_for_blend) if not rg_so_far.empty else None
             blend_p = blend_probas(base_model, mini, X_rn, feature_cols, alpha=alpha)
 
             # Stats
@@ -306,6 +420,18 @@ def expanding_window_backtest(
             all_base_proba.append(base_p)
             all_blend_proba.append(blend_p)
             all_y.append(y_rn)
+
+            # Collecter les prédictions pour betting / conformal
+            if return_preds or (return_cal_preds and year in cal_years):
+                for i, (idx_r, row_r) in enumerate(rn_df.iterrows()):
+                    all_preds_rows.append({
+                        "year": year, "round_number": rn,
+                        "player_a": row_r.get("player_a", ""),
+                        "player_b": row_r.get("player_b", ""),
+                        "p_base": float(base_p[i]),
+                        "p_blend": float(blend_p[i]),
+                        "target": int(y_rn[i]),
+                    })
 
             # Ajouter ce tour aux données RG vues
             rg_seen.append(rn_df)
@@ -335,6 +461,8 @@ def expanding_window_backtest(
             f"Blend Acc={acc_bl:.3f} Brier={brier_bl:.4f}"
         )
 
+    if return_preds or return_cal_preds:
+        return results, pd.DataFrame(all_preds_rows)
     return results
 
 
