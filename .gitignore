@@ -27,6 +27,7 @@ data/rg2026/
 
 #Cache
 data/Cache
+data/
 
 # Jupyter
 .ipynb_checkpoints/
