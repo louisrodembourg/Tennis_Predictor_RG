@@ -161,19 +161,18 @@ def page_results(predictor):
         "Cliquez sur **Entraîner le modèle** une fois tous les résultats saisis."
     )
 
-    from data_loader import get_player_list
-    all_players_hist = set(get_player_list(predictor.df) or PLAYER_LIST_DEFAULT)
-
-    # Ajoute les joueurs du tirage (inclut les qualifiés non présents en base)
     try:
         from rg2026_bracket import load_draw, DRAW_PATH
-        if DRAW_PATH.exists():
-            draw_players = [r["player_name"] for r in load_draw() if r.get("player_name")]
-            all_players_hist.update(draw_players)
+        draw_players = sorted(
+            r["player_name"] for r in load_draw()
+            if r.get("player_name") and "TBD" not in r.get("player_name", "") and "Qualifier" not in r.get("player_name", "")
+        ) if DRAW_PATH.exists() else []
     except Exception:
-        pass
-
-    all_players = sorted(all_players_hist)
+        draw_players = []
+    if not draw_players:
+        from data_loader import get_player_list
+        draw_players = sorted(set(get_player_list(predictor.df) or PLAYER_LIST_DEFAULT))
+    all_players = draw_players
 
     # Formulaire de saisie
     with st.form("result_form"):
@@ -1115,12 +1114,21 @@ def page_betting(_predictor):
                                          value=1000, step=100)
         min_ev = st.slider("EV minimum pour parier", min_value=0.0, max_value=0.20,
                             value=0.03, step=0.01, format="%.2f")
+        max_ev = st.slider("EV maximum (filtre erreurs de données)", min_value=0.10, max_value=1.00,
+                            value=0.50, step=0.05, format="%.2f",
+                            help="Les paris avec EV > seuil sont probablement des erreurs de matching. 50% recommandé.")
     with col_p2:
         strategies_sel = st.multiselect(
             "Stratégies à comparer",
             ["full_kelly", "half_kelly", "capped_kelly", "fixed_ev_tier", "kelly_by_round"],
             default=["half_kelly", "capped_kelly", "fixed_ev_tier"],
         )
+        min_odds = st.slider("Cote minimale", min_value=1.05, max_value=2.00,
+                              value=1.30, step=0.05, format="%.2f",
+                              help="En dessous de cette cote, Kelly diverge. 1.30 recommandé.")
+        hard_kelly_cap = st.slider("Mise max par pari (% bankroll)", min_value=1, max_value=25,
+                                    value=10, step=1, format="%d%%",
+                                    help="Plafond absolu pour toutes les stratégies Kelly. 10% recommandé.") / 100.0
 
     if st.button("▶️ Lancer la simulation", type="primary"):
         with st.spinner("Simulation en cours..."):
@@ -1129,6 +1137,9 @@ def page_betting(_predictor):
                 strategies=strategies_sel,
                 initial_bankroll=bankroll_init,
                 min_ev_threshold=min_ev,
+                hard_kelly_cap=hard_kelly_cap,
+                min_odds=min_odds,
+                max_ev=max_ev,
             )
         st.session_state["betting_results"] = results
         st.rerun()
@@ -1197,8 +1208,21 @@ def page_betting(_predictor):
 # Page Calculateur de Paris
 # ------------------------------------------------------------------
 
-def _bet_metrics(p_a: float, p_b: float, odds_a: float, odds_b: float, bankroll: float, confidence: float):
-    """Calcule EV, edge, Kelly pour les deux joueurs d'un match."""
+def _bet_metrics(
+    p_a: float, p_b: float, odds_a: float, odds_b: float,
+    bankroll: float, confidence: float,
+    hard_kelly_cap: float = 0.10,
+    min_odds: float = 1.30,
+    max_ev: float = 0.50,
+):
+    """Calcule EV, edge, Kelly pour les deux joueurs d'un match.
+
+    Filtres appliqués (identiques au backtest corrigé) :
+      - odds < min_odds      → pari rejeté (Kelly diverge)
+      - EV > max_ev          → pari rejeté (probable erreur de données)
+      - p > 0.98 et odds > 5 → pari rejeté (incohérence modèle/marché)
+      - Mise plafonnée à hard_kelly_cap × bankroll
+    """
     overround = 1 / odds_a + 1 / odds_b
     implied_a = (1 / odds_a) / overround
     implied_b = (1 / odds_b) / overround
@@ -1210,11 +1234,27 @@ def _bet_metrics(p_a: float, p_b: float, odds_a: float, odds_b: float, bankroll:
         b = o - 1
         return max((b * p - (1 - p)) / b, 0.0)
 
-    stake_a = round(0.5 * kelly(p_a, odds_a) * bankroll, 2)
-    stake_b = round(0.5 * kelly(p_b, odds_b) * bankroll, 2)
+    raw_stake_a = round(0.5 * kelly(p_a, odds_a) * bankroll, 2)
+    raw_stake_b = round(0.5 * kelly(p_b, odds_b) * bankroll, 2)
+    # Plafond absolu
+    stake_a = min(raw_stake_a, hard_kelly_cap * bankroll)
+    stake_b = min(raw_stake_b, hard_kelly_cap * bankroll)
 
-    def stars(ev, conf):
-        if ev <= 0 or conf < 20:
+    def _is_valid(ev, odds, p):
+        """Retourne True si le pari passe tous les filtres de sanité."""
+        if odds < min_odds:
+            return False, f"cote {odds:.2f} < minimum {min_odds:.2f}"
+        if ev > max_ev:
+            return False, f"EV {ev:.0%} > max {max_ev:.0%} (possible erreur données)"
+        if p > 0.98 and odds > 5.0:
+            return False, f"incohérence modèle/marché (p={p:.0%}, cote={odds:.2f})"
+        return True, ""
+
+    valid_a, reason_a = _is_valid(ev_a, odds_a, p_a)
+    valid_b, reason_b = _is_valid(ev_b, odds_b, p_b)
+
+    def stars(ev, conf, valid):
+        if not valid or ev <= 0.03 or conf < 20:
             return ""
         if ev > 0.10 and conf > 40:
             return "★★★"
@@ -1227,8 +1267,12 @@ def _bet_metrics(p_a: float, p_b: float, odds_a: float, odds_b: float, bankroll:
         "margin": (overround - 1) * 100,
         "ev_a": ev_a, "ev_b": ev_b,
         "edge_a": p_a - implied_a, "edge_b": p_b - implied_b,
-        "stake_a": stake_a, "stake_b": stake_b,
-        "stars_a": stars(ev_a, confidence), "stars_b": stars(ev_b, confidence),
+        "stake_a": stake_a if valid_a else 0.0,
+        "stake_b": stake_b if valid_b else 0.0,
+        "stars_a": stars(ev_a, confidence, valid_a),
+        "stars_b": stars(ev_b, confidence, valid_b),
+        "valid_a": valid_a, "valid_b": valid_b,
+        "reason_a": reason_a, "reason_b": reason_b,
     }
 
 
@@ -1289,10 +1333,30 @@ def page_bet_calculator(predictor):
             if not unconfirmed:
                 st.info("Tous les matchs de ce tour ont déjà un résultat confirmé.")
             else:
-                bankroll_bulk = st.number_input(
-                    "Bankroll (€)", min_value=10.0, value=1000.0,
-                    step=50.0, format="%.0f", key="bulk_bank",
-                )
+                col_bank_b, col_cap_b, col_minodds_b, col_maxev_b = st.columns(4)
+                with col_bank_b:
+                    bankroll_bulk = st.number_input(
+                        "Bankroll (€)", min_value=10.0, value=1000.0,
+                        step=50.0, format="%.0f", key="bulk_bank",
+                    )
+                with col_cap_b:
+                    bulk_hard_cap = st.slider(
+                        "Mise max / pari (%)", min_value=1, max_value=25, value=10, step=1,
+                        format="%d%%", key="bulk_cap",
+                        help="Plafond absolu Kelly — 10% recommandé",
+                    ) / 100.0
+                with col_minodds_b:
+                    bulk_min_odds = st.slider(
+                        "Cote minimale", min_value=1.05, max_value=2.00, value=1.30,
+                        step=0.05, format="%.2f", key="bulk_minodds",
+                        help="En dessous, Kelly diverge",
+                    )
+                with col_maxev_b:
+                    bulk_max_ev = st.slider(
+                        "EV max (filtre erreurs) %", min_value=10, max_value=100, value=50,
+                        step=5, format="%d%%", key="bulk_maxev",
+                        help="EV > seuil = probable erreur de données",
+                    ) / 100.0
 
                 st.markdown(
                     f"**{len(unconfirmed)} matchs à venir** — saisis les cotes bookmaker "
@@ -1341,7 +1405,10 @@ def page_bet_calculator(predictor):
                         pred_full = predictor.predict_match(pa, pb, item["round"])
                         conf = pred_full["confidence_score"]
 
-                        m = _bet_metrics(p_a, p_b, oa, ob, bankroll_bulk, conf)
+                        m = _bet_metrics(p_a, p_b, oa, ob, bankroll_bulk, conf,
+                                         hard_kelly_cap=bulk_hard_cap,
+                                         min_odds=bulk_min_odds,
+                                         max_ev=bulk_max_ev)
 
                         for player, p, odds, ev, edge, stake, stars in [
                             (pa, p_a, oa, m["ev_a"], m["edge_a"], m["stake_a"], m["stars_a"]),
@@ -1392,15 +1459,18 @@ def page_bet_calculator(predictor):
     with tab_single:
         st.caption("Analyse détaillée d'un match précis.")
 
-        from data_loader import get_player_list
-        all_players_hist = set(get_player_list(predictor.df) or PLAYER_LIST_DEFAULT)
         try:
             from rg2026_bracket import load_draw, DRAW_PATH
-            if DRAW_PATH.exists():
-                all_players_hist.update(r["player_name"] for r in load_draw() if r.get("player_name"))
+            draw_players = sorted(
+                r["player_name"] for r in load_draw()
+                if r.get("player_name") and "TBD" not in r.get("player_name", "") and "Qualifier" not in r.get("player_name", "")
+            ) if DRAW_PATH.exists() else []
         except Exception:
-            pass
-        all_players = sorted(all_players_hist)
+            draw_players = []
+        if not draw_players:
+            from data_loader import get_player_list
+            draw_players = sorted(set(get_player_list(predictor.df) or PLAYER_LIST_DEFAULT))
+        all_players = draw_players
 
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -1424,6 +1494,24 @@ def page_bet_calculator(predictor):
             bankroll = st.number_input("Bankroll (€)", min_value=10.0, value=1000.0,
                                         step=50.0, format="%.0f", key="bc_bank")
 
+        col_cap_s, col_minodds_s, col_maxev_s = st.columns(3)
+        with col_cap_s:
+            single_hard_cap = st.slider(
+                "Mise max / pari (%)", min_value=1, max_value=25, value=10, step=1,
+                format="%d%%", key="single_cap",
+                help="Plafond absolu Kelly",
+            ) / 100.0
+        with col_minodds_s:
+            single_min_odds = st.slider(
+                "Cote minimale", min_value=1.05, max_value=2.00, value=1.30,
+                step=0.05, format="%.2f", key="single_minodds",
+            )
+        with col_maxev_s:
+            single_max_ev = st.slider(
+                "EV max (filtre erreurs) %", min_value=10, max_value=100, value=50,
+                step=5, format="%d%%", key="single_maxev",
+            ) / 100.0
+
         if st.button("Analyser", type="primary"):
             with st.spinner("Calcul…"):
                 pred = predictor.predict_match(player_a, player_b, round_num)
@@ -1431,7 +1519,10 @@ def page_bet_calculator(predictor):
             p_a = pred["proba_a"]
             p_b = pred["proba_b"]
             confidence = pred["confidence_score"]
-            m = _bet_metrics(p_a, p_b, odds_a, odds_b, bankroll, confidence)
+            m = _bet_metrics(p_a, p_b, odds_a, odds_b, bankroll, confidence,
+                              hard_kelly_cap=single_hard_cap,
+                              min_odds=single_min_odds,
+                              max_ev=single_max_ev)
 
             col_pred, col_conf = st.columns([3, 1])
             with col_pred:
@@ -1455,11 +1546,13 @@ def page_bet_calculator(predictor):
             st.caption(f"Marge bookmaker : **{m['margin']:.1f}%**")
 
             st.divider()
-            for player, ev, edge, stake, odds_val, stars in [
-                (player_a, m["ev_a"], m["edge_a"], m["stake_a"], odds_a, m["stars_a"]),
-                (player_b, m["ev_b"], m["edge_b"], m["stake_b"], odds_b, m["stars_b"]),
+            for player, ev, edge, stake, odds_val, stars, valid, reason in [
+                (player_a, m["ev_a"], m["edge_a"], m["stake_a"], odds_a, m["stars_a"], m["valid_a"], m["reason_a"]),
+                (player_b, m["ev_b"], m["edge_b"], m["stake_b"], odds_b, m["stars_b"], m["valid_b"], m["reason_b"]),
             ]:
-                if ev <= 0:
+                if not valid:
+                    st.warning(f"**{player}** — pari filtré : {reason}")
+                elif ev <= 0:
                     st.error(f"**{player}** — EV {ev:+.1%} : ne pas parier")
                 elif ev < 0.03 or confidence < 20:
                     st.warning(f"**{player}** — EV {ev:+.1%} · confiance {confidence:.0f}/100 : prudence")

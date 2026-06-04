@@ -69,11 +69,12 @@ def _build_name_lookup(sackmann_names: list[str]) -> dict[str, str]:
 def match_player_name(
     td_name: str,
     lookup: dict[str, str],
-    cutoff: float = 0.80,
+    cutoff: float = 0.85,
 ) -> Optional[str]:
     """
     Retourne le nom Sackmann correspondant à un nom tennis-data.co.uk.
     Essaie d'abord un match exact (normalisé ASCII), puis fuzzy si nécessaire.
+    Cutoff relevé à 0.85 pour éviter les faux positifs (ex: Djokovic → mauvais joueur).
     """
     key = _ascii_norm(td_name.strip())
     if key in lookup:
@@ -294,22 +295,33 @@ class BankrollSimulator:
     Simule une gestion de bankroll sur les prédictions du backtest.
 
     Stratégies disponibles :
-      - "full_kelly"    : mise = f* × bankroll
-      - "half_kelly"    : mise = 0.5 × f* × bankroll
-      - "capped_kelly"  : mise = min(f* × bankroll, 5% × bankroll)
+      - "full_kelly"    : mise = f* × bankroll  (plafonné à hard_kelly_cap)
+      - "half_kelly"    : mise = 0.5 × f* × bankroll  (plafonné à hard_kelly_cap)
+      - "capped_kelly"  : mise = min(f* × bankroll, kelly_cap × bankroll)
       - "fixed_ev_tier" : mise par tranche d'EV (1%, 2%, 3% du bankroll)
       - "kelly_by_round": facteur Kelly par tour (R128=0.5×, R64/R32=1×, R16/QF=0.5×, SF/F=0×)
+
+    Filtres de sanité appliqués à chaque pari :
+      - odds < min_odds  → ignoré (Kelly explose sur les très grosses cotes inverses)
+      - EV > max_ev      → ignoré (probablement une erreur de données/matching)
+      - p_model > 0.98 ET odds > 5.0 → ignoré (incohérence modèle/marché = mauvais matching)
 
     Parameters
     ----------
     strategy : str
-        Nom de la stratégie parmi celles listées ci-dessus.
+        Nom de la stratégie.
     initial_bankroll : float
         Bankroll initiale (défaut 1000 €).
     min_ev_threshold : float
         EV minimum pour placer un pari (défaut 0.03 = 3%).
     kelly_cap : float
-        Plafond de mise pour la stratégie capped_kelly (en fraction du bankroll, défaut 0.05).
+        Plafond de mise pour capped_kelly (fraction du bankroll, défaut 0.05).
+    hard_kelly_cap : float
+        Plafond absolu appliqué à toutes les stratégies Kelly (défaut 0.10 = 10%).
+    min_odds : float
+        Cote minimale pour parier (défaut 1.30). En dessous, Kelly diverge.
+    max_ev : float
+        EV maximum accepté (défaut 0.50 = 50%). Au-delà, probable erreur de données.
     """
 
     def __init__(
@@ -318,6 +330,9 @@ class BankrollSimulator:
         initial_bankroll: float = 1000.0,
         min_ev_threshold: float = 0.03,
         kelly_cap: float = 0.05,
+        hard_kelly_cap: float = 0.10,
+        min_odds: float = 1.30,
+        max_ev: float = 0.50,
     ):
         if strategy not in ("full_kelly", "half_kelly", "capped_kelly", "fixed_ev_tier", "kelly_by_round"):
             raise ValueError(f"Stratégie inconnue: {strategy}")
@@ -325,6 +340,9 @@ class BankrollSimulator:
         self.initial_bankroll = initial_bankroll
         self.min_ev_threshold = min_ev_threshold
         self.kelly_cap = kelly_cap
+        self.hard_kelly_cap = hard_kelly_cap
+        self.min_odds = min_odds
+        self.max_ev = max_ev
 
     def run(self, predictions_df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -348,12 +366,25 @@ class BankrollSimulator:
             if np.isnan(odds) or odds <= 1.0:
                 continue
 
+            # Filtre cote minimale : en dessous de min_odds, Kelly diverge
+            if odds < self.min_odds:
+                continue
+
             ev = calculate_ev(p, odds)
             if ev <= self.min_ev_threshold:
                 continue
 
+            # Filtre EV maximale : au-delà de max_ev, probable erreur de matching/données
+            if ev > self.max_ev:
+                continue
+
+            # Filtre sanité : p très élevé + cote très élevée = incohérence → mauvais matching
+            if p > 0.98 and odds > 5.0:
+                continue
+
             stake = self._compute_stake(ev, odds, bankroll, rn)
-            stake = min(stake, bankroll)
+            # Plafond absolu : jamais plus de hard_kelly_cap de la bankroll
+            stake = min(stake, self.hard_kelly_cap * bankroll, bankroll)
             if stake <= 0:
                 continue
 
@@ -468,6 +499,9 @@ def run_betting_backtest(
     strategies: list[str] | None = None,
     initial_bankroll: float = 1000.0,
     min_ev_threshold: float = 0.03,
+    hard_kelly_cap: float = 0.10,
+    min_odds: float = 1.30,
+    max_ev: float = 0.50,
 ) -> dict:
     """
     Joint les prédictions aux cotes et exécute toutes les stratégies.
@@ -488,6 +522,9 @@ def run_betting_backtest(
             strategy=strat,
             initial_bankroll=initial_bankroll,
             min_ev_threshold=min_ev_threshold,
+            hard_kelly_cap=hard_kelly_cap,
+            min_odds=min_odds,
+            max_ev=max_ev,
         )
         history = sim.run(matched)
         metrics = compute_metrics(history, initial_bankroll=initial_bankroll)

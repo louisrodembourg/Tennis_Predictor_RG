@@ -65,18 +65,18 @@ BLEND_DECAY_LO = 20          # n_rg_matches où le decay commence
 BLEND_DECAY_HI = 200         # n_rg_matches où le decay se termine
 BLEND_ALPHA_TARGET = 0.55    # plancher alpha en fin de tournoi (hors SF/F)
 ALPHA_FLOOR_LATE_ROUND = 0.80  # plancher alpha pour SF et Finale (round >= 6)
-TEMPORAL_LAMBDA = 0.0        # pondération temporelle : exp(-lambda * années); 0 = désactivé
+TEMPORAL_LAMBDA = 0.005      # pondération temporelle : exp(-lambda * années); Optuna 50t v3
 
 XGB_PARAMS = {
-    "n_estimators": 481,
-    "max_depth": 6,
-    "learning_rate": 0.13488920131075532,
-    "subsample": 0.7599888384711799,
-    "colsample_bytree": 0.7379574222491043,
-    "min_child_weight": 4,
-    "gamma": 0.17089420663452654,
-    "reg_alpha": 0.1927608191335158,
-    "reg_lambda": 0.5819143307194267,
+    "n_estimators": 440,
+    "max_depth": 8,
+    "learning_rate": 0.10182788587538401,
+    "subsample": 0.8308404106999066,
+    "colsample_bytree": 0.6659514199752712,
+    "min_child_weight": 8,
+    "gamma": 0.7901236115421069,
+    "reg_alpha": 2.7962475610305884,
+    "reg_lambda": 2.126883015236859,
     "eval_metric": "logloss",
     "random_state": 42,
     "n_jobs": -1,
@@ -124,6 +124,8 @@ class BacktestResult:
     accuracy_blend: float = 0.0
     brier_blend: float = 0.0
     log_loss_blend: float = 0.0
+    accuracy_stack: float = 0.0
+    brier_stack: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +304,7 @@ def expanding_window_backtest(
     return_cal_preds: bool = False,
     cal_years: list[int] | None = None,
     use_clay_calibration: bool = False,
+    use_ensemble: bool = False,
 ) -> list[BacktestResult] | tuple[list[BacktestResult], pd.DataFrame]:
     """
     Pour chaque édition RG (2017-2025) :
@@ -355,6 +358,19 @@ def expanding_window_backtest(
             calibration_df=calibration_df_year,
         )
 
+        # Optionally train LightGBM + meta-learner for stacking
+        lgbm_model = None
+        meta_model = None
+        if use_ensemble:
+            from ensemble import train_lgbm, train_stacked_ensemble
+            lgbm_model = train_lgbm(
+                train_df, feature_cols, calibrate=True,
+                calibration_cv=calibration_cv,
+                temporal_lambda=temporal_lambda,
+            )
+            if calibration_df_year is not None and not calibration_df_year.empty:
+                meta_model = train_stacked_ensemble(base_model, lgbm_model, calibration_df_year, feature_cols)
+
         # --- Simulation online round par round (tableau principal uniquement) ---
         rounds = sorted(r for r in rg_year_df["round_number"].unique()
                         if r in MAIN_DRAW_ROUNDS)
@@ -362,11 +378,12 @@ def expanding_window_backtest(
         by_round_rows: list[dict] = []
         all_base_proba: list[np.ndarray] = []
         all_blend_proba: list[np.ndarray] = []
+        all_stack_proba: list[np.ndarray] = []
         all_y: list[np.ndarray] = []
 
         # Matchs bruts de l'année pour diff_sets_played_rg (si fournis)
         rg_raw_year: pd.DataFrame = pd.DataFrame()
-        if rg_raw_df is not None:
+        if rg_raw_df is not None and not rg_raw_df.empty and "tourney_date" in rg_raw_df.columns:
             rg_raw_year = rg_raw_df[rg_raw_df["tourney_date"].dt.year == year].copy()
 
         for rn in rounds:
@@ -400,11 +417,20 @@ def expanding_window_backtest(
             mini = train_mini_model(rg_so_far, feature_cols, min_rg=min_rg_for_blend) if not rg_so_far.empty else None
             blend_p = blend_probas(base_model, mini, X_rn, feature_cols, alpha=alpha)
 
+            # Ensemble (stacked XGB + LGBM) — only when use_ensemble=True
+            if use_ensemble and lgbm_model is not None:
+                from ensemble import stacked_predict_proba
+                stack_p = stacked_predict_proba(base_model, lgbm_model, meta_model, rn_df, feature_cols)
+            else:
+                stack_p = base_p
+
             # Stats
             acc_base  = accuracy_score(y_rn, (base_p  >= 0.5).astype(int))
             brier_base  = brier_score_loss(y_rn, base_p)
             acc_blend = accuracy_score(y_rn, (blend_p >= 0.5).astype(int))
             brier_blend = brier_score_loss(y_rn, blend_p)
+            acc_stack = accuracy_score(y_rn, (stack_p >= 0.5).astype(int))
+            brier_stack = brier_score_loss(y_rn, stack_p)
 
             by_round_rows.append({
                 "round_number":    rn,
@@ -414,11 +440,14 @@ def expanding_window_backtest(
                 "brier_base":      brier_base,
                 "acc_blend":       acc_blend,
                 "brier_blend":     brier_blend,
+                "acc_stack":       acc_stack,
+                "brier_stack":     brier_stack,
                 "rg_matches_used": n_rg,
             })
 
             all_base_proba.append(base_p)
             all_blend_proba.append(blend_p)
+            all_stack_proba.append(stack_p)
             all_y.append(y_rn)
 
             # Collecter les prédictions pour betting / conformal
@@ -437,9 +466,10 @@ def expanding_window_backtest(
             rg_seen.append(rn_df)
 
         # Métriques globales
-        y_all    = np.concatenate(all_y)
-        base_all = np.concatenate(all_base_proba)
+        y_all     = np.concatenate(all_y)
+        base_all  = np.concatenate(all_base_proba)
         blend_all = np.concatenate(all_blend_proba)
+        stack_all = np.concatenate(all_stack_proba)
 
         acc   = accuracy_score(y_all, (base_all  >= 0.5).astype(int))
         brier = brier_score_loss(y_all, base_all)
@@ -447,6 +477,8 @@ def expanding_window_backtest(
         acc_bl   = accuracy_score(y_all, (blend_all >= 0.5).astype(int))
         brier_bl = brier_score_loss(y_all, blend_all)
         ll_bl    = log_loss(y_all, np.column_stack([1 - blend_all, blend_all]), labels=[0, 1])
+        acc_st   = accuracy_score(y_all, (stack_all >= 0.5).astype(int))
+        brier_st = brier_score_loss(y_all, stack_all)
 
         results.append(BacktestResult(
             year=year,
@@ -454,11 +486,14 @@ def expanding_window_backtest(
             n_matches=len(y_all),   # matchs tableau principal uniquement (hors qualifs)
             by_round=pd.DataFrame(by_round_rows),
             accuracy_blend=acc_bl, brier_blend=brier_bl, log_loss_blend=ll_bl,
+            accuracy_stack=acc_st, brier_stack=brier_st,
         ))
+        stack_str = f" | Stack Acc={acc_st:.3f} Brier={brier_st:.4f}" if use_ensemble else ""
         tqdm.write(
             f"  RG {year}: "
             f"Base Acc={acc:.3f} Brier={brier:.4f} | "
             f"Blend Acc={acc_bl:.3f} Brier={brier_bl:.4f}"
+            f"{stack_str}"
         )
 
     if return_preds or return_cal_preds:

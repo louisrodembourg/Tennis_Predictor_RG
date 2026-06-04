@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-FEATURE_VERSION = "v2"  # increment to invalidate stale feature cache
+FEATURE_VERSION = "v3"  # increment to invalidate stale feature cache
 BEST_ROUND_ENCODING = {"R128": 1, "R64": 2, "R32": 3, "R16": 4, "QF": 5, "SF": 6, "F": 7}
 _EMPTY = pd.DataFrame()
 
@@ -159,8 +159,10 @@ class HistoryIndex:
 
     def _build_player_state(self, history: pd.DataFrame) -> pd.DataFrame:
         # --- Format long (gagnant + perdant) ---
-        w_cols = ["tourney_date", "surface", "score", "minutes", "winner_name", "loser_name", "tourney_id", "best_of"] + [f"w_{c}" for c in _SRV_NORM]
-        l_cols = ["tourney_date", "surface", "score", "minutes", "loser_name", "winner_name", "tourney_id", "best_of"] + [f"l_{c}" for c in _SRV_NORM]
+        _RET_OPP_W = ["l_svpt", "l_1stWon", "l_2ndWon"]  # opponent (loser) serve stats → winner's return
+        _RET_OPP_L = ["w_svpt", "w_1stWon", "w_2ndWon"]  # opponent (winner) serve stats → loser's return
+        w_cols = ["tourney_date", "surface", "score", "minutes", "winner_name", "loser_name", "tourney_id", "best_of", "loser_rank"] + [f"w_{c}" for c in _SRV_NORM] + _RET_OPP_W
+        l_cols = ["tourney_date", "surface", "score", "minutes", "loser_name", "winner_name", "tourney_id", "best_of", "winner_rank"] + [f"l_{c}" for c in _SRV_NORM] + _RET_OPP_L
 
         w = history[[c for c in w_cols if c in history.columns]].copy()
         l = history[[c for c in l_cols if c in history.columns]].copy()
@@ -168,10 +170,14 @@ class HistoryIndex:
             return _EMPTY
 
         w = w.rename(columns={"winner_name": "player", "loser_name": "opponent",
-                               **{f"w_{c}": c for c in _SRV_NORM}})
+                               **{f"w_{c}": c for c in _SRV_NORM},
+                               "l_svpt": "opp_svpt", "l_1stWon": "opp_1stWon", "l_2ndWon": "opp_2ndWon",
+                               "loser_rank": "opp_rank"})
         w["won"] = True
         l = l.rename(columns={"loser_name": "player", "winner_name": "opponent",
-                               **{f"l_{c}": c for c in _SRV_NORM}})
+                               **{f"l_{c}": c for c in _SRV_NORM},
+                               "w_svpt": "opp_svpt", "w_1stWon": "opp_1stWon", "w_2ndWon": "opp_2ndWon",
+                               "winner_rank": "opp_rank"})
         l["won"] = False
 
         df = pd.concat([w, l], ignore_index=True)
@@ -224,6 +230,8 @@ class HistoryIndex:
         out_avg_duration_12m     = np.full(N, 90.0)
         out_days_since_non_clay  = np.zeros(N)
         out_clay_streak_tourns   = np.zeros(N)
+        out_return_pts_pct          = np.full(N, 0.35)  # default ~35% return pts won
+        out_clay_win_vs_top50_12m   = np.full(N, 0.5)
 
         # df est déjà trié par (player, tourney_date)
         player_col = df["player"].values
@@ -233,6 +241,24 @@ class HistoryIndex:
         clay_m_col = df["is_clay"].values.astype(float)
         sets_col   = df["sets_played"].values.astype(float)
         mins_col   = df["minutes"].values.astype(float)
+
+        # Opponent rank (for quality-adjusted win rate)
+        if "opp_rank" in df.columns:
+            df["opp_rank"] = pd.to_numeric(df["opp_rank"], errors="coerce").fillna(999.0)
+            opp_rank_col = df["opp_rank"].values.astype(float)
+        else:
+            opp_rank_col = np.full(N, 999.0)
+
+        # Return stats: opponent serve points available?
+        _ret_cols = ["opp_svpt", "opp_1stWon", "opp_2ndWon"]
+        for c in _ret_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        ret_ok = all(c in df.columns for c in _ret_cols)
+        if ret_ok:
+            opp_svpt_col  = df["opp_svpt"].values.astype(float)
+            opp_1won_col  = df["opp_1stWon"].values.astype(float)
+            opp_2won_col  = df["opp_2ndWon"].values.astype(float)
 
         # Colonnes service (optionnelles)
         if srv_ok:
@@ -359,6 +385,30 @@ class HistoryIndex:
                 np.divide(fw20, fi20, out=out_fswp[s:e], where=(fi20 > 0))
                 np.divide(bs20, bf20, out=out_bpsp[s:e], where=(bf20 > 0))
 
+            if ret_ok:
+                osp = opp_svpt_col[s:e]
+                o1w = opp_1won_col[s:e]
+                o2w = opp_2won_col[s:e]
+                ret_won = np.maximum(osp - o1w - o2w, 0.0)
+                def _ret(arr: np.ndarray, w: int = 20) -> np.ndarray:
+                    cs = np.empty(n + 1); cs[0] = 0.0; np.cumsum(arr, out=cs[1:])
+                    st = np.maximum(0, idx - w)
+                    return cs[idx] - cs[st]
+                ret_won20  = _ret(ret_won)
+                osp20      = _ret(osp)
+                np.divide(ret_won20, osp20, out=out_return_pts_pct[s:e], where=(osp20 > 0))
+
+            # clay_win_rate_vs_top50_12m: clay wins vs rank ≤ 50 in past 12 months
+            opp_r = opp_rank_col[s:e]
+            is_vs_top50_clay = ((opp_r <= 50) & (clay_m == 1)).astype(float)
+            win_vs_top50_clay = (won_arr * is_vs_top50_clay).astype(float)
+            cs_vt   = np.empty(n + 1); cs_vt[0]  = 0.0; np.cumsum(is_vs_top50_clay, out=cs_vt[1:])
+            cs_wvt  = np.empty(n + 1); cs_wvt[0] = 0.0; np.cumsum(win_vs_top50_clay, out=cs_wvt[1:])
+            st_12m  = np.searchsorted(dates, dates - 365 * DAY, side="left")
+            cnt_vt  = cs_vt[idx] - cs_vt[st_12m]
+            wins_vt = cs_wvt[idx] - cs_wvt[st_12m]
+            np.divide(wins_vt, cnt_vt, out=out_clay_win_vs_top50_12m[s:e], where=(cnt_vt > 0))
+
         result = pd.DataFrame({
             "player":                  player_col,
             "tourney_date":            df["tourney_date"].values,
@@ -379,8 +429,10 @@ class HistoryIndex:
             "pct_3plus_sets_12m":      out_pct_3plus_sets_12m,
             "pct_5sets_12m":           out_pct_5sets_12m,
             "avg_match_duration_12m":  out_avg_duration_12m,
-            "days_since_non_clay":     out_days_since_non_clay,
-            "clay_streak_tournaments": out_clay_streak_tourns,
+            "days_since_non_clay":          out_days_since_non_clay,
+            "clay_streak_tournaments":      out_clay_streak_tourns,
+            "return_pts_won_pct":           out_return_pts_pct,
+            "clay_win_rate_vs_top50_12m":   out_clay_win_vs_top50_12m,
         })
         return result.sort_values(["player", "tourney_date"]).reset_index(drop=True)
 
@@ -470,8 +522,36 @@ class HistoryIndex:
             0.5,
         )
 
+        # Exponentially-weighted H2H rate: recent matches count more (λ=0.3/year)
+        _H2H_DECAY = 0.3
+        _DAY_NS = np.timedelta64(1, "D")
+        N_h = len(long)
+        out_h2h_recent = np.full(N_h, 0.5)
+        _p_h = long["player"].values
+        _o_h = long["opponent"].values
+        _d_h = long["tourney_date"].values.astype("datetime64[D]")
+        _w_h = long["won_i"].values.astype(float)
+        # Build per (player, opponent) groups
+        pair_key = np.array([f"{p}|||{o}" for p, o in zip(_p_h, _o_h)])
+        pair_bounds = np.where(np.concatenate([[True], pair_key[1:] != pair_key[:-1], [True]]))[0]
+        for _k in range(len(pair_bounds) - 1):
+            _s, _e = int(pair_bounds[_k]), int(pair_bounds[_k + 1])
+            _dates = _d_h[_s:_e]
+            _wins  = _w_h[_s:_e]
+            for _i in range(_e - _s):
+                if _i == 0:
+                    continue  # no prior H2H
+                ref = _dates[_i]
+                years_ago = (_dates[:_i] - ref) / _DAY_NS / -365.25  # positive = past
+                weights = np.exp(-_H2H_DECAY * np.maximum(years_ago, 0.0))
+                w_sum = weights.sum()
+                if w_sum > 0:
+                    out_h2h_recent[_s + _i] = float(np.dot(weights, _wins[:_i]) / w_sum)
+        long["h2h_clay_rate_recent"] = out_h2h_recent
+
         return long[["player", "opponent", "tourney_date",
-                      "h2h_clay_wins_a", "h2h_clay_total", "h2h_clay_rate"]].copy()
+                      "h2h_clay_wins_a", "h2h_clay_total", "h2h_clay_rate",
+                      "h2h_clay_rate_recent"]].copy()
 
     # ------------------------------------------------------------------
     # Lookups (toutes O(n_joueur))
@@ -678,6 +758,7 @@ def build_features(
         "win_rate_clay_90d", "win_streak_clay",
         "pct_3plus_sets_12m", "pct_5sets_12m", "avg_match_duration_12m",
         "days_since_non_clay", "clay_streak_tournaments",
+        "return_pts_won_pct", "clay_win_rate_vs_top50_12m",
     ]
     if not index.player_state.empty:
         state_a = index.player_state.rename(columns={"player": "player_a", **{c: f"{c}_a" for c in player_state_cols}})
@@ -722,11 +803,15 @@ def build_features(
     # H2H clay A/B
     if not index.h2h_state.empty:
         h2h = index.h2h_state.rename(columns={"player": "player_a", "opponent": "player_b"})
-        base = _merge_asof_by_keys(base, h2h[["player_a", "player_b", "tourney_date", "h2h_clay_wins_a", "h2h_clay_total", "h2h_clay_rate"]], by=["player_a", "player_b"])
+        h2h_cols = ["player_a", "player_b", "tourney_date", "h2h_clay_wins_a", "h2h_clay_total", "h2h_clay_rate"]
+        if "h2h_clay_rate_recent" in h2h.columns:
+            h2h_cols.append("h2h_clay_rate_recent")
+        base = _merge_asof_by_keys(base, h2h[h2h_cols], by=["player_a", "player_b"])
     else:
         base["h2h_clay_wins_a"] = 0
         base["h2h_clay_total"] = 0
         base["h2h_clay_rate"] = 0.5
+        base["h2h_clay_rate_recent"] = 0.5
 
     # Remplissage des NaN pour les premiers matchs de chaque joueur
     fill_defaults = {
@@ -736,17 +821,20 @@ def build_features(
         "win_rate_clay_90d_a": 0.5, "win_streak_clay_a": 0,
         "pct_3plus_sets_12m_a": 0.5, "pct_5sets_12m_a": 0.4, "avg_match_duration_12m_a": 90.0,
         "days_since_non_clay_a": 0, "clay_streak_tournaments_a": 0,
+        "return_pts_won_pct_a": 0.35, "clay_win_rate_vs_top50_12m_a": 0.5,
         "matches_21d_b": 0, "sets_21d_b": 0, "minutes_21d_b": 0,
         "win_rate_clay_12m_b": 0.5, "win_rate_clay_6m_b": 0.5, "win_rate_30d_b": 0.5, "win_rate_last10_b": 0.5,
         "first_serve_pct_b": 0.6, "first_serve_won_pct_b": 0.7, "bp_saved_pct_b": 0.6, "matches_before_b": 0, "wins_before_b": 0,
         "win_rate_clay_90d_b": 0.5, "win_streak_clay_b": 0,
         "pct_3plus_sets_12m_b": 0.5, "pct_5sets_12m_b": 0.4, "avg_match_duration_12m_b": 90.0,
         "days_since_non_clay_b": 0, "clay_streak_tournaments_b": 0,
+        "return_pts_won_pct_b": 0.35, "clay_win_rate_vs_top50_12m_b": 0.5,
         "rg_win_rate_a": 0.5, "rg_matches_a": 0, "best_round_rg_a": 1,
         "rg_win_rate_b": 0.5, "rg_matches_b": 0, "best_round_rg_b": 1,
         "win_rate_rg_3yr_a": 0.5, "best_round_rg_3yr_a": 1,
         "win_rate_rg_3yr_b": 0.5, "best_round_rg_3yr_b": 1,
         "h2h_clay_wins_a": 0, "h2h_clay_total": 0, "h2h_clay_rate": 0.5,
+        "h2h_clay_rate_recent": 0.5,
     }
     for c, default in fill_defaults.items():
         if c in base.columns:
@@ -783,6 +871,10 @@ def build_features(
         "age_clay_elo_interaction_a":   age_clay_a,
         "age_clay_elo_interaction_b":   age_clay_b,
         "diff_age_clay_elo_interaction": age_clay_a - age_clay_b,
+        # Return performance (Phase 3)
+        "diff_return_pts_won_pct":      base.get("return_pts_won_pct_a", 0.35)        - base.get("return_pts_won_pct_b", 0.35),
+        # Quality-adjusted win rate (Phase 3)
+        "diff_clay_win_rate_vs_top50":  base.get("clay_win_rate_vs_top50_12m_a", 0.5) - base.get("clay_win_rate_vs_top50_12m_b", 0.5),
     }
     base = pd.concat([base, pd.DataFrame(extra, index=base.index)], axis=1).copy()
 
@@ -794,7 +886,7 @@ def build_features(
         "diff_matches_21d", "diff_sets_21d", "diff_minutes_21d", "diff_win_rate_last10",
         "matches_21d_a", "matches_21d_b", "sets_21d_a", "sets_21d_b", "minutes_21d_a", "minutes_21d_b",
         "win_rate_clay_12m_a", "win_rate_clay_12m_b",
-        "h2h_clay_wins_a", "h2h_clay_total", "h2h_clay_rate",
+        "h2h_clay_wins_a", "h2h_clay_total", "h2h_clay_rate", "h2h_clay_rate_recent",
         "rg_win_rate_a", "rg_win_rate_b", "diff_rg_win_rate", "rg_matches_a", "rg_matches_b",
         "best_round_rg_a", "best_round_rg_b", "diff_best_round_rg",
         "ranking_diff", "log_ranking_diff",
@@ -810,6 +902,8 @@ def build_features(
         "diff_age_clay_elo_interaction",
         "win_rate_rg_3yr_a", "win_rate_rg_3yr_b", "best_round_rg_3yr_a", "best_round_rg_3yr_b",
         "age_clay_elo_interaction_a", "age_clay_elo_interaction_b",
+        # Phase-3 new features
+        "diff_return_pts_won_pct", "diff_clay_win_rate_vs_top50",
     ]
 
     for col in output_cols:
@@ -859,6 +953,8 @@ def build_symmetric_dataset(feature_df: pd.DataFrame) -> pd.DataFrame:
         df_neg["h2h_clay_wins_a"] = h2h_total_orig - h2h_wins_orig
     if "h2h_clay_rate" in feature_df.columns:
         df_neg["h2h_clay_rate"] = 1.0 - feature_df["h2h_clay_rate"]
+    if "h2h_clay_rate_recent" in feature_df.columns:
+        df_neg["h2h_clay_rate_recent"] = 1.0 - feature_df["h2h_clay_rate_recent"]
     df_neg["ranking_diff"]    = -feature_df["ranking_diff"]
     df_neg["log_ranking_diff"] = -feature_df["log_ranking_diff"]
 
@@ -882,7 +978,7 @@ FEATURE_COLS = [
     "matches_21d_a", "matches_21d_b", "sets_21d_a", "sets_21d_b",
     "minutes_21d_a", "minutes_21d_b",
     # H2H clay
-    "h2h_clay_rate", "h2h_clay_total",
+    "h2h_clay_rate", "h2h_clay_rate_recent", "h2h_clay_total",
     # Performance Roland Garros (carrière + 3 ans glissant)
     "diff_rg_win_rate", "rg_matches_a", "rg_matches_b", "diff_best_round_rg",
     "diff_win_rate_rg_3yr", "diff_best_round_rg_3yr",
@@ -891,12 +987,14 @@ FEATURE_COLS = [
     # Âge + interaction non-linéaire (Phase 2)
     "age_a", "age_b",
     "diff_age_clay_elo_interaction",
-    # Service (signal faible mais non nul)
-    "diff_first_serve_won_pct", "diff_bp_saved_pct",
+    # Service / Return (signal faible mais non nul)
+    "diff_first_serve_won_pct", "diff_bp_saved_pct", "diff_return_pts_won_pct",
+    # Quality-adjusted clay win rate (vs top-50)
+    "diff_clay_win_rate_vs_top50",
     # Endurance / style de jeu (Phase 2)
     "diff_pct_3plus_sets_12m", "diff_pct_5sets_12m", "diff_avg_match_duration_12m",
     # Transition de surface (Phase 2)
     "diff_days_since_non_clay", "diff_clay_streak_tournaments",
     # Contexte tournoi
-    "round_number", "diff_sets_played_rg",
+    "round_number",
 ]

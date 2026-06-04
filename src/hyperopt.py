@@ -36,6 +36,7 @@ def _score_params(
     calibration_cv: int = 3,
     feature_cols: list[str] = FEATURE_COLS,
     years: list[int] = CV_YEARS,
+    temporal_lambda: float = 0.0,
 ) -> float:
     """
     Score de Brier moyen pondéré (expanding window) sur les années données.
@@ -62,10 +63,17 @@ def _score_params(
         X_tr = sym[feature_cols].fillna(0)
         y_tr = sym["target"]
 
+        sample_weight = None
+        if temporal_lambda > 0.0 and "tourney_date" in sym.columns:
+            ref_date = pd.to_datetime(sym["tourney_date"]).max()
+            years_ago = (ref_date - pd.to_datetime(sym["tourney_date"])).dt.days / 365.25
+            sample_weight = np.exp(-temporal_lambda * years_ago.values)
+
         try:
             xgb = XGBClassifier(**params, eval_metric="logloss", random_state=42, n_jobs=-1)
             model = CalibratedClassifierCV(xgb, cv=calibration_cv, method=calibration_method)
-            model.fit(X_tr, y_tr)
+            fit_kwargs = {} if sample_weight is None else {"sample_weight": sample_weight}
+            model.fit(X_tr, y_tr, **fit_kwargs)
         except Exception:
             return np.inf
 
@@ -103,9 +111,9 @@ def run_optuna(
 
     def objective(trial: optuna.Trial) -> float:
         params = {
-            "n_estimators":     trial.suggest_int("n_estimators", 100, 500),
-            "max_depth":        trial.suggest_int("max_depth", 2, 6),
-            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+            "n_estimators":     trial.suggest_int("n_estimators", 200, 1000),
+            "max_depth":        trial.suggest_int("max_depth", 2, 8),
+            "learning_rate":    trial.suggest_float("learning_rate", 0.005, 0.20, log=True),
             "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
             "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
@@ -115,11 +123,13 @@ def run_optuna(
         }
         cal_method = trial.suggest_categorical("calibration_method", ["isotonic", "sigmoid"])
         cal_cv = trial.suggest_int("calibration_cv", 3, 5)
+        temporal_lambda = trial.suggest_float("temporal_lambda", 0.0, 0.4)
 
         return _score_params(
             params, all_feat, rg_feat,
             calibration_method=cal_method,
             calibration_cv=cal_cv,
+            temporal_lambda=temporal_lambda,
         )
 
     def _cb(study: optuna.Study, trial: optuna.Trial) -> None:
@@ -148,8 +158,13 @@ def load_best_params() -> Optional[dict]:
 
 def get_xgb_params(best: dict) -> dict:
     """Extrait les paramètres XGBoost purs depuis le dict Optuna (enlève les méta-clés)."""
-    skip = {"calibration_method", "calibration_cv", "_best_brier", "_n_trials"}
+    skip = {"calibration_method", "calibration_cv", "temporal_lambda", "_best_brier", "_n_trials"}
     return {k: v for k, v in best.items() if k not in skip}
+
+
+def get_temporal_lambda(best: dict) -> float:
+    """Extrait temporal_lambda depuis le dict Optuna (0.0 si absent)."""
+    return float(best.get("temporal_lambda", 0.0))
 
 
 # ---------------------------------------------------------------------------
