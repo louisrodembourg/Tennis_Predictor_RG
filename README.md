@@ -1,121 +1,94 @@
-# Roland Garros 2026 Predictor
+# Roland Garros Match Predictor
 
-Système de prédiction de matchs basé sur WElo surface-spécifique + XGBoost, entraîné en expanding window sur les données ATP historiques (Jeff Sackmann).
+Predicts the winner of every Roland Garros men's match from historical ATP data, with
+a surface-specific Elo (WElo) and a calibrated XGBoost model trained in an expanding
+window, so the model never sees the future.
 
-## Installation
+**Result:** about **82 % match accuracy** in the expanding-window backtest over
+Roland Garros 2017–2025, each edition predicted only from the matches played before it.
+The backtest also reports the Brier score and log-loss per edition and per round, and
+compares the model against ranking-based, clay-Elo and WElo baselines.
+
+## Approach
+
+- **Ratings:** four Elo variants are implemented and compared: standard Elo, a separate
+  rating per surface weighted by tournament prestige, WElo (a "hot-hand" K-factor) and
+  an adjusted Elo that blends overall and surface ratings. The blend weight is tuned on
+  Roland Garros.
+- **Features:** 41 pre-match features: recent and clay form, a clay win streak,
+  fatigue over the previous 21 days (matches, sets, minutes; the most important group),
+  clay head-to-head, Roland Garros history, ranking, age, serve and return statistics.
+  Highly correlated Elo variants (r > 0.96) are dropped.
+- **Model:** XGBoost with isotonic calibration, blended with a model specialised on
+  Roland Garros matches. Hyperparameters are searched with Optuna (50 trials, Brier
+  score objective, cross-validation on 2017–2022 with 2023–2025 held out).
+- **Uncertainty:** split conformal prediction gives an interval around each win
+  probability, with a guaranteed coverage level.
+- **Extras:** SHAP feature analysis, a LightGBM + XGBoost stacking variant, Monte Carlo
+  simulation of the full draw, and a betting simulator (expected value, Kelly sizing,
+  ROI and drawdown) on historical odds.
+
+## Leakage checks
+
+The tests in `tests/` check that:
+
+- only pre-match Elo is used;
+- the clay rating is not updated on hard or grass matches;
+- head-to-head is computed strictly before the match date;
+- the dataset is symmetric, so the model has no player-position bias;
+- retraining after a new result works.
+
+## Quick start
 
 ```bash
-cd TennisPredictor
-
-# Créer et activer l'environnement virtuel
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Installer les dépendances
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+
+bash scripts/download_data.sh        # ATP results from JeffSackmann/tennis_atp → data/raw/
+python scripts/run_backtest.py       # backtest 2017–2025 (add --save-csv to export)
+streamlit run dashboard/app.py       # interactive dashboard
+pytest tests/ -v
 ```
 
-## Télécharger les données
+The dashboard has four pages: a Monte Carlo simulation of the draw with Elo profiles,
+match-by-match predictions with the deciding features, a form to enter live results
+(the ratings update and the model retrains), and the historical backtest.
 
-```bash
-bash scripts/download_data.sh
-```
-
-Cela clone le repo [Jeff Sackmann/tennis_atp](https://github.com/JeffSackmann/tennis_atp) et copie les fichiers CSV dans `data/raw/`.
-
-## Backtesting (2017–2025)
-
-```bash
-python scripts/run_backtest.py
-# Avec sauvegarde CSV :
-python scripts/run_backtest.py --save-csv
-```
-
-Affiche dans le terminal :
-- Accuracy / Brier Score / Log-Loss par édition Roland Garros
-- Comparaison XGBoost vs baselines (ranking, Clay Elo, WElo)
-- Décomposition par tour
-
-## Dashboard interactif
-
-```bash
-streamlit run dashboard/app.py
-```
-
-Ouvre automatiquement `http://localhost:8501` avec 4 sections :
-
-| Section | Description |
-|---|---|
-| **Vue d'ensemble** | Simulation Monte Carlo du tableau, profils Elo |
-| **Match par match** | Prédiction avec radar comparatif et features décisives |
-| **Saisie résultats** | Formulaire de saisie + réentraînement automatique |
-| **Backtesting** | Graphes de performance historique 2017-2025 |
-
-## Saisir un résultat pendant le tournoi
-
-Via le dashboard (section "Saisie résultats"), ou en Python :
+From Python:
 
 ```python
 from src.predictor import RolandGarrosPredictor
 
 pred = RolandGarrosPredictor("data/raw")
+pred.predict_match("Carlos Alcaraz", "Jannik Sinner", round_number=7)
+# {'winner_predicted': ..., 'proba_a': ..., 'proba_b': ..., ...}
 
-# Prédire un match
-result = pred.predict_match("Carlos Alcaraz", "Jannik Sinner", round_number=7)
-print(result)
-# {'winner_predicted': 'Carlos Alcaraz', 'proba_a': 0.64, 'proba_b': 0.36, ...}
-
-# Enregistrer un résultat réel
-pred.add_result(
-    winner="Carlos Alcaraz",
-    loser="Jannik Sinner",
-    score="6-3 7-5 6-1",
-    round_number=7,
-)
-# → Elo mis à jour + modèle réentraîné automatiquement
+pred.add_result(winner="Carlos Alcaraz", loser="Jannik Sinner",
+                score="6-3 7-5 6-1", round_number=7)   # Elo updated, model retrained
 ```
 
-Les résultats saisis sont persistés dans `data/rg2026/results.jsonl` et rechargés à chaque démarrage.
+Results entered during the tournament are stored in `data/rg2026/results.jsonl`.
 
-## Architecture
+## Structure
 
 ```
 src/
-├── data_loader.py   # Chargement CSV Sackmann (2000-2025)
-├── elo.py           # Standard Elo / Surface Elo / WElo / AdjustedElo
-├── features.py      # Feature engineering sans data leakage
-├── model.py         # XGBoost + expanding window backtesting
-├── predictor.py     # API principale (predict, add_result, simulate)
-└── backtesting.py   # Pipeline de backtesting standalone
+├── data_loader.py      # Sackmann ATP CSVs (2000–2025)
+├── elo.py              # Standard, surface, WElo and adjusted Elo
+├── features.py         # leakage-free feature engineering
+├── model.py            # calibrated XGBoost, expanding-window training
+├── ensemble.py         # LightGBM + XGBoost stacking
+├── conformal.py        # split conformal prediction intervals
+├── hyperopt.py         # Optuna search
+├── betting.py          # odds, expected value, Kelly bankroll simulation
+├── rg2026_bracket.py   # full-draw simulation
+├── predictor.py        # main API (predict, add_result, simulate)
+└── backtesting.py      # standalone backtest pipeline
 ```
 
-## Modèles Elo implémentés
+## References
 
-| Système | Description |
-|---|---|
-| **Standard Elo** | Elo classique toutes surfaces, K=32 |
-| **Surface Elo** | Un rating séparé par surface (Clay/Hard/Grass), K pondéré par prestige du tournoi |
-| **WElo** | Hot-hand : K multiplié par `1 + α·résultat_précédent` (α optimisé) |
-| **AdjustedElo** | `(1−λ)·StandardElo + λ·SurfaceElo` (λ optimisé sur RG) |
-
-## Tests
-
-```bash
-pip install pytest
-pytest tests/ -v
-```
-
-Tests vérifiés :
-- No data leakage (Elo pré-match uniquement)
-- Clay Elo non mis à jour sur hard/grass
-- H2H calculé avant la date du match
-- Dataset symétrique (pas de biais de position)
-- Réentraînement du modèle
-
-## Sources
-
-- Angelini et al. (2022) — WElo : *ScienceDirect*
-- Williams et al. — AdjustedElo pour Grands Chelems : *NTU*
-- Kovalchik (2023) — XGBoost + features tennis : *PMLR*
-- Buhamra et al. (2025) — Âge optimal 28-32 ans : *arXiv*
-- Données : [JeffSackmann/tennis_atp](https://github.com/JeffSackmann/tennis_atp)
+- Angelini et al. (2022), WElo: a weighted Elo rating system for tennis
+- Williams et al., adjusted Elo for Grand Slams
+- Kovalchik (2023), XGBoost and tennis features
+- Data: [JeffSackmann/tennis_atp](https://github.com/JeffSackmann/tennis_atp)
